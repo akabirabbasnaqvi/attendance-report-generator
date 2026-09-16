@@ -1,143 +1,795 @@
-from __future__ import annotations
+"""
+attendance_report.py – Attendance report engine (fixed version)
+Reads a schedule workbook and a device-export workbook, matches employees
+by fuzzy name logic, and produces per-day attendance rows plus a summary.
+"""
 
-import io
 import re
-from datetime import date, datetime, time, timedelta
-from pathlib import Path
+import math
+import datetime as _dt
+from datetime import datetime, timedelta, time as _time
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-
+# ── constants ────────────────────────────────────────────────────────────
 GRACE_MINUTES = 15
-NON_WORKING_STATES = {"OFF", "WFH", "LV", "LEAVE", "RESIGNED"}
-SCHEDULE_VALUE_PATTERN = re.compile(r"^\s*(?:\d{1,2}(?::\d{2})?(?::\d{2})?(?:\s*-|$)|OFF$|WFH$|LV$|LEAVE$|RESIGNED$)", re.IGNORECASE)
+
+# canonical leave / non-working codes
+_LEAVE_ALIASES: Dict[str, str] = {
+    "off":                "OFF",
+    "wfh":                "WFH",
+    "lv":                 "LEAVE",
+    "leave":              "LEAVE",
+    "resigned":           "RESIGNED",
+    "sl":                 "SL",
+    "s/l":                "SL",
+    "sick leave":         "SL",
+    "cl":                 "CL",
+    "contingency l":      "CL",
+    "al":                 "AL",
+    "annual leave":       "AL",
+    "annual leaves":      "AL",
+    "emergency leave":    "EL",
+    "m. leave":           "ML",
+    "maternity leave":    "ML",
+    "unpaid":             "UNPAID",
+    "unpaid leave":       "UNPAID",
+    "absent":             "ABSENT",
+    "join":               "JOIN",
+    "compansated leaves": "COMP",
+    "compensated leave":  "COMP",
+    "compensated leaves": "COMP",
+    "compansated leave":  "COMP",
+    "comp off":           "COMP",
+    "half day":           "HALF",
+    "h/d":                "HALF",
+}
+
+_LEAVE_LABELS: Dict[str, str] = {
+    "OFF":      "Off",
+    "WFH":      "Work From Home",
+    "LEAVE":    "Leave",
+    "RESIGNED": "Resigned",
+    "SL":       "Sick Leave",
+    "CL":       "Contingency Leave",
+    "AL":       "Annual Leave",
+    "EL":       "Emergency Leave",
+    "ML":       "Maternity Leave",
+    "UNPAID":   "Unpaid Leave",
+    "ABSENT":   "Absent",
+    "JOIN":     "Joining",
+    "COMP":     "Compensated Leave",
+    "HALF":     "Half Day",
+}
+
+# all codes that mean "not working that day"
+NON_WORKING_CODES = set(_LEAVE_LABELS.keys())
+
+# codes that count toward leave totals in summary
+_LEAVE_COUNT_CODES = {"SL", "CL", "AL", "EL", "ML", "UNPAID", "ABSENT",
+                       "COMP", "LEAVE", "HALF"}
+
+# ── junk-row filtering ──────────────────────────────────────────────────
+_JUNK_ROW_NAMES = {
+    "finance", "inventory", "surveillance department", "surveillance",
+    "automation & it department", "automation", "it department",
+    "reporting", "operations department", "operations",
+    "leave policy", "working hours", "annual leaves", "annual leave",
+    "punctuality", "late comming", "late coming", "shift changes",
+    "department", "departments", "staff", "employee", "employees",
+    "name", "names", "sr", "sr.", "sr.no", "s.no", "no.",
+    "monday", "tuesday", "wednesday", "thursday", "friday",
+    "saturday", "sunday",
+    "note", "notes", "remarks", "total", "grand total",
+}
+
+_DAY_NAMES = {"monday", "tuesday", "wednesday", "thursday", "friday",
+              "saturday", "sunday"}
 
 
-def read_workbook(uploaded_file_or_path, **kwargs) -> pd.DataFrame:
-    """Read xlsx and legacy xls files, including the duplicated .xls extension."""
-    name = getattr(uploaded_file_or_path, "name", str(uploaded_file_or_path)).lower()
-    engine = "xlrd" if name.endswith(".xls") else "openpyxl"
-    return pd.read_excel(uploaded_file_or_path, engine=engine, **kwargs)
+def _is_junk_row(name: str) -> bool:
+    """Return True if *name* is a header / policy row, not an employee."""
+    low = name.strip().lower()
+    if low in _JUNK_ROW_NAMES:
+        return True
+    if low in _DAY_NAMES:
+        return True
+    # very long strings are policy text, not names
+    if len(low) > 60:
+        return True
+    # pure numbers
+    if low.replace(".", "").replace("-", "").isdigit():
+        return True
+    return False
 
 
-def normalize_name(value: object) -> str:
-    value = re.sub(r"\([^)]*\)", "", str(value or ""))
-    return re.sub(r"[^a-z0-9]", "", value.lower())
+# ── time regexes ─────────────────────────────────────────────────────────
+# requires colon – e.g. "9:00", "21:30", "10:00:00"
+_TIME_RE = re.compile(
+    r"^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$"
+)
+# bare hour only if >= 6 (avoids stray "1","2","3" artefacts)
+_BARE_HOUR_RE = re.compile(r"^\s*(\d{1,2})\s*$")
+
+# range like "9:00 - 5:00" or "9:00-17:00"
+_RANGE_RE = re.compile(
+    r"^\s*(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\s*$"
+)
+
+# date-like string to skip (openpyxl sometimes returns datetime as str)
+_DATE_STR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
-def load_punches(source) -> pd.DataFrame:
-    punches = read_workbook(source)
-    punches = punches.rename(columns={"No.": "Name No.", "Employee ID": "Name No.", "Employee Name": "Name"})
-    required = {"Name No.", "Name", "Date/Time"}
-    missing = required - set(punches.columns)
-    if missing:
-        raise ValueError(f"Attendance file is missing columns: {', '.join(sorted(missing))}")
-    punches = punches[["Name No.", "Name", "Date/Time"]].copy()
-    punches["Date/Time"] = pd.to_datetime(punches["Date/Time"], dayfirst=True, errors="coerce")
-    punches = punches.dropna(subset=["Date/Time"])
-    punches["Work Date"] = punches["Date/Time"].dt.date
-    punches["Name Key"] = punches["Name"].map(normalize_name)
-    return punches.sort_values("Date/Time")
+# ── workbook I/O ─────────────────────────────────────────────────────────
+
+def read_workbook(path: str) -> pd.ExcelFile:
+    """Open .xls or .xlsx transparently."""
+    if str(path).lower().endswith(".xls"):
+        return pd.ExcelFile(path, engine="xlrd")
+    return pd.ExcelFile(path, engine="openpyxl")
 
 
-def load_schedule(source) -> pd.DataFrame:
-    workbook = pd.ExcelFile(source, engine="openpyxl")
-    records: list[dict] = []
-    for sheet in workbook.sheet_names:
-        raw = pd.read_excel(source, sheet_name=sheet, header=None, engine="openpyxl")
-        date_row = next((i for i in range(min(5, len(raw))) if raw.iloc[i].map(pd.to_datetime, errors="coerce").notna().sum() >= 2), None)
-        if date_row is None:
+def normalize_name(raw: str) -> str:
+    """Lower-case, collapse whitespace, strip punctuation."""
+    s = str(raw).lower().strip()
+    s = re.sub(r"[._]+", " ", s)       # dots and underscores → space
+    s = re.sub(r"\s+", " ", s)         # collapse whitespace
+    s = re.sub(r"[^a-z0-9 ]", "", s)   # drop remaining punctuation
+    return s.strip()
+
+
+def _name_tokens(norm: str) -> set:
+    """Return the set of word-tokens from a normalized name."""
+    return set(norm.split())
+
+
+# ── fuzzy name matching ──────────────────────────────────────────────────
+
+def _edit_distance(a: str, b: str) -> int:
+    """Simple Levenshtein distance (enough for short tokens)."""
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        curr = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            curr[j] = min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+        prev = curr
+    return prev[lb]
+
+
+def _close_substring(needle: str, haystack: str, max_dist: int = 1) -> bool:
+    """True if *needle* appears inside *haystack* with ≤ *max_dist* edits."""
+    ln, lh = len(needle), len(haystack)
+    if ln > lh:
+        return False
+    for start in range(lh - ln + 1):
+        if _edit_distance(needle, haystack[start:start + ln]) <= max_dist:
+            return True
+    return False
+
+
+def _build_name_map(sched_names: List[str],
+                    punch_names: List[str]) -> Dict[str, str]:
+    """
+    Map each *sched_name* → best matching *punch_name*.
+
+    Strategy (in priority order):
+      1. Exact normalised match
+      2. Schedule name is a substring of an attendance name
+      3. All word-tokens of the shorter name appear in the longer
+      4. Reverse substring (attendance key inside schedule key)
+      5. Fuzzy substring with edit-distance ≤ 1
+    Returns a dict {normalised_sched_name: normalised_punch_name}.
+    """
+    norm_sched = {normalize_name(n): n for n in sched_names}
+    norm_punch = {normalize_name(n): n for n in punch_names}
+    mapping: Dict[str, str] = {}
+
+    unmatched_sched = set(norm_sched.keys())
+    used_punch = set()
+
+    # pass 1 – exact
+    for ns in list(unmatched_sched):
+        if ns in norm_punch and ns not in used_punch:
+            mapping[ns] = ns
+            unmatched_sched.discard(ns)
+            used_punch.add(ns)
+
+    # pass 2 – schedule key is substring of punch key
+    for ns in list(unmatched_sched):
+        if len(ns) < 3:
             continue
-        dates = pd.to_datetime(raw.iloc[date_row], errors="coerce")
-        name_row = next((i for i in range(date_row + 1, min(date_row + 4, len(raw))) if "staff name" in str(raw.iloc[i, 0]).lower()), None)
-        if name_row is None:
-            name_row = date_row + 1
-        for row_index in range(name_row + 1, len(raw)):
-            staff_name = raw.iat[row_index, 0]
-            if pd.isna(staff_name) or str(staff_name).strip().lower() in {"punctuality", "late comming", "shift changes"}:
+        for np in sorted(norm_punch.keys()):
+            if np in used_punch:
                 continue
-            for column_index, schedule_date in dates.items():
-                if pd.isna(schedule_date):
+            if ns in np:
+                mapping[ns] = np
+                unmatched_sched.discard(ns)
+                used_punch.add(np)
+                break
+
+    # pass 3 – word-token containment (all tokens of shorter in longer)
+    for ns in list(unmatched_sched):
+        stok = _name_tokens(ns)
+        if len(stok) < 1:
+            continue
+        best = None
+        best_extra = 999
+        for np in sorted(norm_punch.keys()):
+            if np in used_punch:
+                continue
+            ptok = _name_tokens(np)
+            if stok <= ptok:                 # sched tokens ⊆ punch tokens
+                extra = len(ptok) - len(stok)
+                if extra < best_extra:
+                    best = np
+                    best_extra = extra
+            elif ptok <= stok:               # reverse
+                extra = len(stok) - len(ptok)
+                if extra < best_extra:
+                    best = np
+                    best_extra = extra
+        if best is not None:
+            mapping[ns] = best
+            unmatched_sched.discard(ns)
+            used_punch.add(best)
+
+    # pass 4 – reverse substring
+    for ns in list(unmatched_sched):
+        for np in sorted(norm_punch.keys()):
+            if np in used_punch:
+                continue
+            if len(np) >= 3 and np in ns:
+                mapping[ns] = np
+                unmatched_sched.discard(ns)
+                used_punch.add(np)
+                break
+
+    # pass 5 – fuzzy substring (edit dist ≤ 1)
+    for ns in list(unmatched_sched):
+        stok = ns.split()
+        for np in sorted(norm_punch.keys()):
+            if np in used_punch:
+                continue
+            ptok = np.split()
+            # try matching each schedule token fuzzily against punch tokens
+            matched_tokens = 0
+            for st in stok:
+                if len(st) < 3:
                     continue
-                value = str(raw.iat[row_index, column_index]).strip() if column_index < raw.shape[1] and not pd.isna(raw.iat[row_index, column_index]) else ""
-                if value and normalize_name(value) != normalize_name(staff_name) and SCHEDULE_VALUE_PATTERN.match(value):
-                    records.append({"Work Date": schedule_date.date(), "Schedule Name": str(staff_name).strip(), "Name Key": normalize_name(staff_name), "Schedule": value})
-    if not records:
-        raise ValueError("No dated schedule rows were found in the schedule workbook.")
-    return pd.DataFrame(records).drop_duplicates(["Work Date", "Name Key"])
+                for pt in ptok:
+                    if _close_substring(st, pt, max_dist=1) or \
+                       _close_substring(pt, st, max_dist=1):
+                        matched_tokens += 1
+                        break
+            meaningful_sched = [t for t in stok if len(t) >= 3]
+            if meaningful_sched and matched_tokens >= len(meaningful_sched):
+                mapping[ns] = np
+                unmatched_sched.discard(ns)
+                used_punch.add(np)
+                break
+
+    return mapping
 
 
-def parse_start_time(schedule_value: str) -> time | None:
-    match = re.match(r"^\s*(\d{1,2})(?::(\d{2}))?(?::\d{2})?(?:\s*-|$)", schedule_value)
-    if not match:
+# ── schedule cell helpers ────────────────────────────────────────────────
+
+def _cell_to_schedule_str(val) -> Optional[str]:
+    """
+    Convert an openpyxl cell value to a schedule-string we can parse.
+    Returns None if the cell should be skipped entirely.
+    """
+    if val is None:
         return None
-    return time(int(match.group(1)) % 24, int(match.group(2) or 0))
+    # datetime.time objects from openpyxl (time-formatted cells)
+    if isinstance(val, _time):
+        return val.strftime("%H:%M")
+    # datetime / Timestamp objects – likely dates bleeding from header row
+    if isinstance(val, (datetime, _dt.date, pd.Timestamp)):
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    # skip date-like strings
+    if _DATE_STR_RE.match(s):
+        return None
+    return s
 
 
-def expected_datetime(work_date: date, scheduled_start: time, punches: pd.Series) -> datetime:
-    candidates = [datetime.combine(work_date, scheduled_start), datetime.combine(work_date, scheduled_start) + timedelta(hours=12)]
-    if punches.empty:
-        return candidates[1]
-    actual = punches.iloc[0].to_pydatetime()
-    return min(candidates, key=lambda candidate: abs((candidate - actual).total_seconds()))
+def _classify_schedule(raw: str) -> Tuple[str, Optional[str]]:
+    """
+    Given a schedule-cell string, return (kind, detail).
+      kind = "time"  → detail is "HH:MM" 24-h start time
+      kind = "range" → detail is "HH:MM" (the start portion)
+      kind = "leave" → detail is canonical code (OFF, SL, etc.)
+      kind = "unknown" → detail is None
+    """
+    low = raw.strip().lower()
+    # check leave codes first
+    if low in _LEAVE_ALIASES:
+        return ("leave", _LEAVE_ALIASES[low])
+
+    # range "9:00 - 17:00"
+    m = _RANGE_RE.match(raw.strip())
+    if m:
+        return ("range", m.group(1))
+
+    # explicit time with colon
+    m = _TIME_RE.match(raw.strip())
+    if m:
+        h, mn = int(m.group(1)), int(m.group(2))
+        return ("time", f"{h}:{mn:02d}")
+
+    # bare hour >= 6
+    m = _BARE_HOUR_RE.match(raw.strip())
+    if m:
+        h = int(m.group(1))
+        if 6 <= h <= 23:
+            return ("time", f"{h}:00")
+        return ("unknown", None)
+
+    return ("unknown", None)
 
 
-def build_report(punches: pd.DataFrame, schedule: pd.DataFrame, year: int, month: int) -> tuple[pd.DataFrame, pd.DataFrame]:
-    selected_dates = pd.date_range(date(year, month, 1), date(year, month, 1) + pd.offsets.MonthEnd(1)).date
-    schedule_month = schedule[schedule["Work Date"].isin(selected_dates)].copy()
-    attendance_employees = punches[["Name No.", "Name", "Name Key"]].drop_duplicates("Name No.").copy()
-    attendance_employees["Name"] = attendance_employees.apply(
-        lambda row: str(row["Name No."]) if normalize_name(row["Name"]) == normalize_name(row["Name No."]) else row["Name"], axis=1
+# ── punch loading ────────────────────────────────────────────────────────
+
+def load_punches(xf: pd.ExcelFile) -> Dict[str, Dict[str, List[datetime]]]:
+    """
+    Return {normalised_name: {date_str: [punch_datetimes]}}.
+    """
+    df = xf.parse(xf.sheet_names[0])
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # find the datetime column
+    dt_col = None
+    for c in df.columns:
+        if "date" in c.lower() and "time" in c.lower():
+            dt_col = c
+            break
+    if dt_col is None:
+        for c in df.columns:
+            if "date" in c.lower():
+                dt_col = c
+                break
+    if dt_col is None:
+        raise ValueError("Cannot find a Date/Time column in device data.")
+
+    name_col = None
+    for c in df.columns:
+        if c.lower().strip() == "name":
+            name_col = c
+            break
+    if name_col is None:
+        raise ValueError("Cannot find a 'Name' column in device data.")
+
+    punches: Dict[str, Dict[str, List[datetime]]] = defaultdict(
+        lambda: defaultdict(list)
     )
-    schedule_employees = schedule_month[["Schedule Name", "Name Key"]].drop_duplicates("Name Key").rename(columns={"Schedule Name": "Name"})
-    schedule_employees["Name No."] = ""
-    schedule_employees = schedule_employees[~schedule_employees["Name Key"].isin(attendance_employees["Name Key"])]
-    employees = pd.concat([attendance_employees, schedule_employees], ignore_index=True).sort_values(["Name Key", "Name No."])
-    rows: list[dict] = []
-    for _, employee in employees.iterrows():
-        employee_schedule = schedule_month[schedule_month["Name Key"] == employee["Name Key"]]
-        if employee["Name No."]:
-            employee_punches = punches[punches["Name No."] == employee["Name No."]]
-        else:
-            employee_punches = punches[punches["Name Key"] == employee["Name Key"]]
-        planned_rows = employee_schedule.to_dict("records")
-        if not planned_rows:
-            planned_rows = [{"Work Date": work_date, "Schedule": "", "Schedule Name": employee["Name"]} for work_date in selected_dates]
-        for planned in planned_rows:
-            day_punches = employee_punches[employee_punches["Work Date"] == planned["Work Date"]]
-            schedule_value = planned["Schedule"]
-            state = schedule_value.upper()
-            first_punch = day_punches.iloc[0]["Date/Time"] if not day_punches.empty else pd.NaT
-            start = parse_start_time(schedule_value)
-            if start is not None and "-" not in schedule_value:
-                schedule_value = f"{start.strftime('%I:%M %p')} shift"
-            if not schedule_value:
-                status, scheduled_display = "No schedule match", ""
-            elif state in NON_WORKING_STATES or start is None:
-                if state == "OFF":
-                    status = "Off / Not scheduled"
-                elif state in NON_WORKING_STATES:
-                    status = state.title()
-                elif start is None:
-                    status = "Unrecognized schedule"
-                scheduled_display = schedule_value
-            elif pd.isna(first_punch):
-                status, scheduled_display = "Absent", schedule_value
+    for _, row in df.iterrows():
+        raw_name = row.get(name_col)
+        raw_dt = row.get(dt_col)
+        if pd.isna(raw_name) or pd.isna(raw_dt):
+            continue
+        name = normalize_name(str(raw_name))
+        if not name:
+            continue
+        try:
+            dt = pd.to_datetime(raw_dt)
+        except Exception:
+            continue
+        date_str = dt.strftime("%Y-%m-%d")
+        punches[name][date_str].append(dt.to_pydatetime())
+
+    # sort each day's punches
+    for name in punches:
+        for ds in punches[name]:
+            punches[name][ds].sort()
+
+    return dict(punches)
+
+
+# ── schedule loading ─────────────────────────────────────────────────────
+
+def load_schedule(xf: pd.ExcelFile,
+                  year: int,
+                  month: int) -> Dict[str, Dict[str, str]]:
+    """
+    Return {normalised_name: {date_str: schedule_value_str}}.
+    """
+    target = datetime(year, month, 1)
+    best_sheet = None
+    best_diff = None
+
+    for sn in xf.sheet_names:
+        try:
+            sheet_date = pd.to_datetime(sn, format="%b %Y")
+        except Exception:
+            try:
+                sheet_date = pd.to_datetime(sn)
+            except Exception:
+                continue
+        diff = abs((sheet_date.year - target.year) * 12 +
+                   sheet_date.month - target.month)
+        if best_diff is None or diff < best_diff:
+            best_diff = diff
+            best_sheet = sn
+
+    if best_sheet is None:
+        raise ValueError(f"No sheet found for {target:%B %Y}")
+
+    df = xf.parse(best_sheet, header=None)
+
+    # row 0 = dates, row 1 = day-of-week / department header
+    date_row = df.iloc[0]
+
+    # detect first_date_col: find where actual dates start
+    # Column 0 is the name column; sometimes col 0 also has a date (duplicate)
+    first_date_col = 1
+    for ci in range(len(date_row)):
+        val = date_row.iloc[ci]
+        try:
+            pd.to_datetime(val)
+            first_date_col = ci
+            break
+        except Exception:
+            continue
+    # If col 0 has the same date as col 1, skip it (it's the name col)
+    if first_date_col == 0 and len(date_row) > 1:
+        try:
+            d0 = pd.to_datetime(date_row.iloc[0])
+            d1 = pd.to_datetime(date_row.iloc[1])
+            if d0 == d1:
+                first_date_col = 1
+        except Exception:
+            first_date_col = 1
+
+    # map column index → date string
+    col_dates: Dict[int, str] = {}
+    for ci in range(first_date_col, len(date_row)):
+        val = date_row.iloc[ci]
+        try:
+            dt = pd.to_datetime(val)
+            if dt.month == month and dt.year == year:
+                col_dates[ci] = dt.strftime("%Y-%m-%d")
+        except Exception:
+            continue
+
+    if not col_dates:
+        raise ValueError(f"No date columns found for {target:%B %Y}")
+
+    schedule: Dict[str, Dict[str, str]] = defaultdict(dict)
+
+    for ri in range(2, len(df)):
+        raw_name = df.iloc[ri, 0]
+        if pd.isna(raw_name):
+            continue
+        name_str = str(raw_name).strip()
+        if not name_str:
+            continue
+        if _is_junk_row(name_str):
+            continue
+
+        norm = normalize_name(name_str)
+        if not norm:
+            continue
+
+        for ci, date_str in col_dates.items():
+            cell = df.iloc[ri, ci]
+            sval = _cell_to_schedule_str(cell)
+            if sval is None:
+                continue
+            kind, detail = _classify_schedule(sval)
+            if kind == "unknown":
+                continue
+            # store raw schedule string
+            if kind == "leave":
+                schedule[norm][date_str] = detail   # canonical code
             else:
-                expected = expected_datetime(planned["Work Date"], start, day_punches["Date/Time"])
-                status = "On time" if first_punch <= expected + timedelta(minutes=GRACE_MINUTES) else "Late"
-                scheduled_display = expected.strftime("%I:%M %p")
-            rows.append({"Employee ID": employee["Name No."], "Employee Name": employee["Name"], "Date": planned["Work Date"], "Scheduled": scheduled_display, "First Punch": "" if pd.isna(first_punch) else first_punch.strftime("%I:%M:%S %p"), "Status": status})
-    detail = pd.DataFrame(rows).sort_values(["Employee Name", "Date"])
-    summary = detail.groupby(["Employee ID", "Employee Name"], as_index=False).agg(
-        **{"Working Days": ("Status", lambda values: int(values.isin(["On time", "Late", "Absent"]).sum())), "On Time": ("Status", lambda values: int((values == "On time").sum())), "Late": ("Status", lambda values: int((values == "Late").sum())), "Absent": ("Status", lambda values: int((values == "Absent").sum())), "Off / Not scheduled": ("Status", lambda values: int((values == "Off / Not scheduled").sum())), "No Schedule Match": ("Status", lambda values: int((values == "No schedule match").sum()))}
-    )
-    return detail, summary
+                schedule[norm][date_str] = sval      # time string
+
+    return dict(schedule)
 
 
-def to_excel(detail: pd.DataFrame, summary: pd.DataFrame) -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        summary.to_excel(writer, sheet_name="Employee Summary", index=False)
-        detail.to_excel(writer, sheet_name="Daily Detail", index=False)
-    return output.getvalue()
+# ── time helpers ─────────────────────────────────────────────────────────
+
+def parse_start_time(sched_val: str) -> Optional[_time]:
+    """Parse a schedule value into a time-of-day for the shift start."""
+    if not sched_val:
+        return None
+
+    # range "9:00 - 17:00"
+    m = _RANGE_RE.match(sched_val.strip())
+    if m:
+        sched_val = m.group(1)
+
+    # HH:MM
+    m = _TIME_RE.match(sched_val.strip())
+    if m:
+        h, mn = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mn <= 59:
+            return _time(h, mn)
+        return None
+
+    # bare hour
+    m = _BARE_HOUR_RE.match(sched_val.strip())
+    if m:
+        h = int(m.group(1))
+        if 6 <= h <= 23:
+            return _time(h, 0)
+
+    return None
+
+
+def expected_datetime(shift_time: _time,
+                      date_str: str,
+                      punch: Optional[datetime] = None) -> datetime:
+    """
+    Return the expected clock-in datetime for a shift, resolving AM/PM
+    ambiguity using the actual punch when available.
+    """
+    base_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    candidate = datetime.combine(base_date, shift_time)
+
+    if shift_time.hour >= 12:
+        # unambiguous PM/night
+        return candidate
+
+    # AM shift by default; but if hour < 12, also consider +12h (PM)
+    candidate_pm = candidate + timedelta(hours=12)
+
+    if punch is None:
+        # no punch → assume the AM reading
+        return candidate
+
+    diff_am = abs((punch - candidate).total_seconds())
+    diff_pm = abs((punch - candidate_pm).total_seconds())
+
+    return candidate if diff_am <= diff_pm else candidate_pm
+
+
+# ── build the report ─────────────────────────────────────────────────────
+
+def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
+                 sched_data: Dict[str, Dict[str, str]],
+                 year: int,
+                 month: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Return (daily_df, summary_df).
+    """
+    # Build the name mapping
+    sched_names = list(sched_data.keys())
+    punch_names = list(punch_data.keys())
+    name_map = _build_name_map(sched_names, punch_names)
+
+    # All days in the month
+    first_day = _dt.date(year, month, 1)
+    if month == 12:
+        last_day = _dt.date(year + 1, 1, 1) - _dt.timedelta(days=1)
+    else:
+        last_day = _dt.date(year, month + 1, 1) - _dt.timedelta(days=1)
+    num_days = last_day.day
+    all_dates = [
+        (first_day + _dt.timedelta(days=d)).strftime("%Y-%m-%d")
+        for d in range(num_days)
+    ]
+
+    # Gather all employees (union of schedule + punch names)
+    all_employees = set(sched_data.keys())
+    # Also add punch-only employees not matched
+    matched_punch_names = set(name_map.values())
+    for pn in punch_data:
+        if pn not in matched_punch_names:
+            all_employees.add(pn)
+
+    daily_rows = []
+    summary_rows = []
+
+    for emp in sorted(all_employees):
+        # resolve which punch key to use
+        punch_key = name_map.get(emp, emp)
+        emp_punches = punch_data.get(punch_key, {})
+        emp_schedule = sched_data.get(emp, {})
+
+        # If employee has neither schedule nor punches, skip
+        if not emp_schedule and not emp_punches:
+            continue
+
+        # determine display name: prefer the original-cased version
+        display_name = emp.replace("_", " ").title()
+
+        # summary accumulators
+        present_days = 0
+        late_days = 0
+        on_time_days = 0
+        absent_days = 0
+        wfh_days = 0
+        leave_days = 0
+        leave_detail: Dict[str, int] = defaultdict(int)  # code → count
+
+        for date_str in all_dates:
+            sched_val = emp_schedule.get(date_str)
+            day_punches = emp_punches.get(date_str, [])
+
+            # ── no schedule for this employee at all ──
+            if not emp_schedule:
+                if not day_punches:
+                    continue  # skip days with no data at all
+                # has punches but no schedule
+                first_in = day_punches[0].strftime("%H:%M")
+                last_out = day_punches[-1].strftime("%H:%M") if len(day_punches) > 1 else ""
+                daily_rows.append({
+                    "Employee": display_name,
+                    "Date": date_str,
+                    "Day": datetime.strptime(date_str, "%Y-%m-%d").strftime("%A"),
+                    "Scheduled": "No schedule",
+                    "Status": "Present (no schedule)",
+                    "Clock In": first_in,
+                    "Clock Out": last_out,
+                    "Punch Count": len(day_punches),
+                    "Remarks": "No schedule found",
+                })
+                present_days += 1
+                continue
+
+            # ── has schedule ──
+            if sched_val is None:
+                # no entry for this date in schedule → skip (not scheduled)
+                if day_punches:
+                    first_in = day_punches[0].strftime("%H:%M")
+                    last_out = day_punches[-1].strftime("%H:%M") if len(day_punches) > 1 else ""
+                    daily_rows.append({
+                        "Employee": display_name,
+                        "Date": date_str,
+                        "Day": datetime.strptime(date_str, "%Y-%m-%d").strftime("%A"),
+                        "Scheduled": "—",
+                        "Status": "Present (unscheduled day)",
+                        "Clock In": first_in,
+                        "Clock Out": last_out,
+                        "Punch Count": len(day_punches),
+                        "Remarks": "",
+                    })
+                    present_days += 1
+                continue
+
+            # check if it's a leave / non-working code
+            if sched_val in NON_WORKING_CODES:
+                code = sched_val
+                label = _LEAVE_LABELS.get(code, code)
+                if code == "WFH":
+                    wfh_days += 1
+                elif code == "OFF":
+                    pass  # don't count OFF as leave
+                elif code == "RESIGNED":
+                    pass
+                else:
+                    leave_days += 1
+                    leave_detail[code] += 1
+
+                clock_in = ""
+                clock_out = ""
+                if day_punches:
+                    clock_in = day_punches[0].strftime("%H:%M")
+                    if len(day_punches) > 1:
+                        clock_out = day_punches[-1].strftime("%H:%M")
+
+                daily_rows.append({
+                    "Employee": display_name,
+                    "Date": date_str,
+                    "Day": datetime.strptime(date_str, "%Y-%m-%d").strftime("%A"),
+                    "Scheduled": label,
+                    "Status": label,
+                    "Clock In": clock_in,
+                    "Clock Out": clock_out,
+                    "Punch Count": len(day_punches),
+                    "Remarks": f"Punched despite {label}" if day_punches else "",
+                })
+                continue
+
+            # ── it's a working shift ──
+            shift_start = parse_start_time(sched_val)
+            if shift_start is None:
+                # can't parse → just record raw
+                daily_rows.append({
+                    "Employee": display_name,
+                    "Date": date_str,
+                    "Day": datetime.strptime(date_str, "%Y-%m-%d").strftime("%A"),
+                    "Scheduled": sched_val,
+                    "Status": "Schedule parse error",
+                    "Clock In": "",
+                    "Clock Out": "",
+                    "Punch Count": len(day_punches),
+                    "Remarks": f"Could not parse: {sched_val}",
+                })
+                continue
+
+            sched_display = shift_start.strftime("%H:%M")
+
+            if not day_punches:
+                # absent
+                absent_days += 1
+                daily_rows.append({
+                    "Employee": display_name,
+                    "Date": date_str,
+                    "Day": datetime.strptime(date_str, "%Y-%m-%d").strftime("%A"),
+                    "Scheduled": sched_display,
+                    "Status": "Absent",
+                    "Clock In": "",
+                    "Clock Out": "",
+                    "Punch Count": 0,
+                    "Remarks": "",
+                })
+                continue
+
+            # has punches
+            first_punch = day_punches[0]
+            last_punch = day_punches[-1] if len(day_punches) > 1 else None
+
+            exp_dt = expected_datetime(shift_start, date_str, first_punch)
+            diff_minutes = (first_punch - exp_dt).total_seconds() / 60.0
+
+            grace = timedelta(minutes=GRACE_MINUTES)
+            if first_punch <= exp_dt + grace:
+                status = "On Time"
+                on_time_days += 1
+            else:
+                late_min = math.ceil(diff_minutes)
+                status = f"Late ({late_min} min)"
+                late_days += 1
+
+            present_days += 1
+
+            daily_rows.append({
+                "Employee": display_name,
+                "Date": date_str,
+                "Day": datetime.strptime(date_str, "%Y-%m-%d").strftime("%A"),
+                "Scheduled": sched_display,
+                "Status": status,
+                "Clock In": first_punch.strftime("%H:%M"),
+                "Clock Out": last_punch.strftime("%H:%M") if last_punch else "",
+                "Punch Count": len(day_punches),
+                "Remarks": "",
+            })
+
+        # ── summary row ──
+        leave_breakdown = ", ".join(
+            f"{_LEAVE_LABELS.get(c, c)}: {n}" for c, n in sorted(leave_detail.items())
+        )
+        summary_rows.append({
+            "Employee": display_name,
+            "Present": present_days,
+            "On Time": on_time_days,
+            "Late": late_days,
+            "Absent": absent_days,
+            "WFH": wfh_days,
+            "Leave": leave_days,
+            "Leave Breakdown": leave_breakdown,
+        })
+
+    daily_df = pd.DataFrame(daily_rows)
+    summary_df = pd.DataFrame(summary_rows)
+
+    # sort
+    if not daily_df.empty:
+        daily_df = daily_df.sort_values(["Employee", "Date"]).reset_index(drop=True)
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values("Employee").reset_index(drop=True)
+
+    return daily_df, summary_df
+
+
+# ── Excel export ─────────────────────────────────────────────────────────
+
+def to_excel(daily_df: pd.DataFrame,
+             summary_df: pd.DataFrame,
+             path: str) -> None:
+    """Write both DataFrames to a single .xlsx with two sheets."""
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, sheet_name="Employee Summary", index=False)
+        daily_df.to_excel(writer, sheet_name="Daily Detail", index=False)
