@@ -9,3 +9,4 @@ build/
 dist/
 *.spec
 .streamlit/secrets.toml
+excel_files/
