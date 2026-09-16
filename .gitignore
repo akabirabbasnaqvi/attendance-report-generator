@@ -5,4 +5,7 @@ __pycache__/
 *.xls
 *.xlsx
 attendance_report.xlsx
+build/
+dist/
+*.spec
 .streamlit/secrets.toml

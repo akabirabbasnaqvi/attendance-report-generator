@@ -10,6 +10,7 @@ import pandas as pd
 
 GRACE_MINUTES = 15
 NON_WORKING_STATES = {"OFF", "WFH", "LV", "LEAVE", "RESIGNED"}
+SCHEDULE_VALUE_PATTERN = re.compile(r"^\s*(?:\d{1,2}(?::\d{2})?(?::\d{2})?(?:\s*-|$)|OFF$|WFH$|LV$|LEAVE$|RESIGNED$)", re.IGNORECASE)
 
 
 def read_workbook(uploaded_file_or_path, **kwargs) -> pd.DataFrame:
@@ -59,7 +60,7 @@ def load_schedule(source) -> pd.DataFrame:
                 if pd.isna(schedule_date):
                     continue
                 value = str(raw.iat[row_index, column_index]).strip() if column_index < raw.shape[1] and not pd.isna(raw.iat[row_index, column_index]) else ""
-                if value and normalize_name(value) != normalize_name(staff_name):
+                if value and normalize_name(value) != normalize_name(staff_name) and SCHEDULE_VALUE_PATTERN.match(value):
                     records.append({"Work Date": schedule_date.date(), "Schedule Name": str(staff_name).strip(), "Name Key": normalize_name(staff_name), "Schedule": value})
     if not records:
         raise ValueError("No dated schedule rows were found in the schedule workbook.")
@@ -84,21 +85,35 @@ def expected_datetime(work_date: date, scheduled_start: time, punches: pd.Series
 def build_report(punches: pd.DataFrame, schedule: pd.DataFrame, year: int, month: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     selected_dates = pd.date_range(date(year, month, 1), date(year, month, 1) + pd.offsets.MonthEnd(1)).date
     schedule_month = schedule[schedule["Work Date"].isin(selected_dates)].copy()
-    employees = punches[["Name No.", "Name", "Name Key"]].drop_duplicates("Name No.")
+    attendance_employees = punches[["Name No.", "Name", "Name Key"]].drop_duplicates("Name No.").copy()
+    attendance_employees["Name"] = attendance_employees.apply(
+        lambda row: str(row["Name No."]) if normalize_name(row["Name"]) == normalize_name(row["Name No."]) else row["Name"], axis=1
+    )
+    schedule_employees = schedule_month[["Schedule Name", "Name Key"]].drop_duplicates("Name Key").rename(columns={"Schedule Name": "Name"})
+    schedule_employees["Name No."] = ""
+    schedule_employees = schedule_employees[~schedule_employees["Name Key"].isin(attendance_employees["Name Key"])]
+    employees = pd.concat([attendance_employees, schedule_employees], ignore_index=True).sort_values(["Name Key", "Name No."])
     rows: list[dict] = []
     for _, employee in employees.iterrows():
         employee_schedule = schedule_month[schedule_month["Name Key"] == employee["Name Key"]]
-        if employee_schedule.empty:
-            employee_schedule = schedule_month[schedule_month["Schedule Name"].map(normalize_name) == employee["Name Key"]]
-        for _, planned in employee_schedule.iterrows():
-            day_punches = punches[(punches["Name No."] == employee["Name No."]) & (punches["Work Date"] == planned["Work Date"])]
+        if employee["Name No."]:
+            employee_punches = punches[punches["Name No."] == employee["Name No."]]
+        else:
+            employee_punches = punches[punches["Name Key"] == employee["Name Key"]]
+        planned_rows = employee_schedule.to_dict("records")
+        if not planned_rows:
+            planned_rows = [{"Work Date": work_date, "Schedule": "", "Schedule Name": employee["Name"]} for work_date in selected_dates]
+        for planned in planned_rows:
+            day_punches = employee_punches[employee_punches["Work Date"] == planned["Work Date"]]
             schedule_value = planned["Schedule"]
             state = schedule_value.upper()
             first_punch = day_punches.iloc[0]["Date/Time"] if not day_punches.empty else pd.NaT
             start = parse_start_time(schedule_value)
             if start is not None and "-" not in schedule_value:
                 schedule_value = f"{start.strftime('%I:%M %p')} shift"
-            if state in NON_WORKING_STATES or start is None:
+            if not schedule_value:
+                status, scheduled_display = "No schedule match", ""
+            elif state in NON_WORKING_STATES or start is None:
                 if state == "OFF":
                     status = "Off / Not scheduled"
                 elif state in NON_WORKING_STATES:
@@ -115,7 +130,7 @@ def build_report(punches: pd.DataFrame, schedule: pd.DataFrame, year: int, month
             rows.append({"Employee ID": employee["Name No."], "Employee Name": employee["Name"], "Date": planned["Work Date"], "Scheduled": scheduled_display, "First Punch": "" if pd.isna(first_punch) else first_punch.strftime("%I:%M:%S %p"), "Status": status})
     detail = pd.DataFrame(rows).sort_values(["Employee Name", "Date"])
     summary = detail.groupby(["Employee ID", "Employee Name"], as_index=False).agg(
-        **{"Working Days": ("Status", lambda values: int(values.isin(["On time", "Late", "Absent"]).sum())), "On Time": ("Status", lambda values: int((values == "On time").sum())), "Late": ("Status", lambda values: int((values == "Late").sum())), "Absent": ("Status", lambda values: int((values == "Absent").sum())), "Off / Not scheduled": ("Status", lambda values: int((values == "Off / Not scheduled").sum()))}
+        **{"Working Days": ("Status", lambda values: int(values.isin(["On time", "Late", "Absent"]).sum())), "On Time": ("Status", lambda values: int((values == "On time").sum())), "Late": ("Status", lambda values: int((values == "Late").sum())), "Absent": ("Status", lambda values: int((values == "Absent").sum())), "Off / Not scheduled": ("Status", lambda values: int((values == "Off / Not scheduled").sum())), "No Schedule Match": ("Status", lambda values: int((values == "No schedule match").sum()))}
     )
     return detail, summary
 
