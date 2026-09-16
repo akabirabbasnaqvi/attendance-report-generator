@@ -381,7 +381,7 @@ def load_punches(xf: pd.ExcelFile) -> Dict[str, Dict[str, List[datetime]]]:
         if not name:
             continue
         try:
-            dt = pd.to_datetime(raw_dt)
+            dt = pd.to_datetime(raw_dt, dayfirst=True)
         except Exception:
             continue
         date_str = dt.strftime("%Y-%m-%d")
@@ -556,16 +556,34 @@ def expected_datetime(shift_time: _time,
 
 # ── build the report ─────────────────────────────────────────────────────
 
+def _is_badge_id(name: str) -> bool:
+    """Return True if *name* is purely numeric (a device badge ID, not a real name)."""
+    return name.replace(" ", "").isdigit()
+
+
 def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
                  sched_data: Dict[str, Dict[str, str]],
                  year: int,
-                 month: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+                 month: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Return (daily_df, summary_df).
+    Return (daily_df, summary_df, badge_df).
+
+    badge_df contains punch records for employees whose device only
+    recorded a numeric badge ID instead of a name.  They get their own
+    sheet so they can be identified and cross-referenced.
     """
-    # Build the name mapping
+    # Separate badge-ID-only punches from named punches
+    named_punch_data: Dict[str, Dict[str, List[datetime]]] = {}
+    badge_punch_data: Dict[str, Dict[str, List[datetime]]] = {}
+    for pname, pdays in punch_data.items():
+        if _is_badge_id(pname):
+            badge_punch_data[pname] = pdays
+        else:
+            named_punch_data[pname] = pdays
+
+    # Build the name mapping (only for named employees)
     sched_names = list(sched_data.keys())
-    punch_names = list(punch_data.keys())
+    punch_names = list(named_punch_data.keys())
     name_map = _build_name_map(sched_names, punch_names)
 
     # All days in the month
@@ -580,11 +598,11 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
         for d in range(num_days)
     ]
 
-    # Gather all employees (union of schedule + punch names)
+    # Gather all NAMED employees (union of schedule + named punches)
     all_employees = set(sched_data.keys())
-    # Also add punch-only employees not matched
+    # Also add punch-only named employees not matched
     matched_punch_names = set(name_map.values())
-    for pn in punch_data:
+    for pn in named_punch_data:
         if pn not in matched_punch_names:
             all_employees.add(pn)
 
@@ -594,7 +612,7 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
     for emp in sorted(all_employees):
         # resolve which punch key to use
         punch_key = name_map.get(emp, emp)
-        emp_punches = punch_data.get(punch_key, {})
+        emp_punches = named_punch_data.get(punch_key, {})
         emp_schedule = sched_data.get(emp, {})
 
         # If employee has neither schedule nor punches, skip
@@ -781,15 +799,51 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
     if not summary_df.empty:
         summary_df = summary_df.sort_values("Employee").reset_index(drop=True)
 
-    return daily_df, summary_df
+    # ── Badge-ID punch sheet ──
+    badge_rows = []
+    for badge_id in sorted(badge_punch_data.keys(), key=lambda x: int(x) if x.isdigit() else 0):
+        days = badge_punch_data[badge_id]
+        for date_str in sorted(days.keys()):
+            # only include dates within the target month
+            try:
+                d = datetime.strptime(date_str, "%Y-%m-%d").date()
+                if d.month != month or d.year != year:
+                    continue
+            except Exception:
+                continue
+
+            day_punches = days[date_str]
+            first_in = day_punches[0].strftime("%H:%M") if day_punches else ""
+            last_out = day_punches[-1].strftime("%H:%M") if len(day_punches) > 1 else ""
+            all_times = ", ".join(p.strftime("%H:%M:%S") for p in day_punches)
+
+            badge_rows.append({
+                "Badge ID": badge_id,
+                "Date": date_str,
+                "Day": datetime.strptime(date_str, "%Y-%m-%d").strftime("%A"),
+                "Clock In": first_in,
+                "Clock Out": last_out,
+                "Punch Count": len(day_punches),
+                "All Punch Times": all_times,
+                "Remarks": "Name not registered on device",
+            })
+
+    badge_df = pd.DataFrame(badge_rows)
+    if not badge_df.empty:
+        badge_df = badge_df.sort_values(["Badge ID", "Date"]).reset_index(drop=True)
+
+    return daily_df, summary_df, badge_df
 
 
 # ── Excel export ─────────────────────────────────────────────────────────
 
 def to_excel(daily_df: pd.DataFrame,
              summary_df: pd.DataFrame,
-             path: str) -> None:
-    """Write both DataFrames to a single .xlsx with two sheets."""
+             path: str,
+             badge_df: Optional[pd.DataFrame] = None) -> None:
+    """Write DataFrames to a single .xlsx with separate sheets."""
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         summary_df.to_excel(writer, sheet_name="Employee Summary", index=False)
         daily_df.to_excel(writer, sheet_name="Daily Detail", index=False)
+        if badge_df is not None and not badge_df.empty:
+            badge_df.to_excel(writer, sheet_name="Badge ID Punches", index=False)
