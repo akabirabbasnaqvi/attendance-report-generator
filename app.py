@@ -10,6 +10,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox
 import tkinter as tk
 import tkinter.ttk as ttk
+import pandas as pd
 
 try:
     import customtkinter as ctk
@@ -171,15 +172,18 @@ class AttendanceApp:
             tab_summary = self.tabview.add("Employee Summary")
             tab_detail = self.tabview.add("Daily Detail")
             tab_badge = self.tabview.add("Badge ID Punches")
+            tab_comparison = self.tabview.add("Name Comparison")
         else:
             nb = ttk.Notebook(root)
             nb.pack(fill="both", expand=True, padx=16, pady=(4, 12))
             tab_summary = ttk.Frame(nb)
             tab_detail = ttk.Frame(nb)
             tab_badge = ttk.Frame(nb)
+            tab_comparison = ttk.Frame(nb)
             nb.add(tab_summary, text="Employee Summary")
             nb.add(tab_detail, text="Daily Detail")
             nb.add(tab_badge, text="Badge ID Punches")
+            nb.add(tab_comparison, text="Name Comparison")
 
         self.summary_tree = self._make_tree(tab_summary, [
             "Employee", "Present", "On Time", "Late",
@@ -193,11 +197,18 @@ class AttendanceApp:
             "Badge ID", "Date", "Day", "Clock In",
             "Clock Out", "Punch Count", "All Punch Times", "Remarks",
         ])
+        self.comparison_tree = self._make_tree(tab_comparison, [
+            "Category",
+            "Name or ID",
+            "Normalized Key",
+            "Details",
+        ])
 
         # keep references for export
         self.daily_df = None
         self.summary_df = None
         self.badge_df = None
+        self.comparison_df = None
 
     # ── helpers ──────────────────────────────────────────────────────────
 
@@ -283,14 +294,15 @@ class AttendanceApp:
             schedule = load_schedule(sched_xf, year, month)
 
             self._update_status("Building report…")
-            daily_df, summary_df, badge_df = build_report(punches, schedule, year, month)
+            daily_df, summary_df, badge_df, comparison_df = build_report(punches, schedule, year, month)
 
             self.daily_df = daily_df
             self.summary_df = summary_df
             self.badge_df = badge_df
+            self.comparison_df = comparison_df
 
             # populate trees on main thread
-            self.root.after(0, lambda: self._populate(daily_df, summary_df, badge_df))
+            self.root.after(0, lambda: self._populate(daily_df, summary_df, badge_df, comparison_df))
             badge_count = len(badge_df) if badge_df is not None and not badge_df.empty else 0
             self._update_status(
                 f"Done – {len(summary_df)} employees, {len(daily_df)} rows, {badge_count} badge-ID punches")
@@ -302,7 +314,7 @@ class AttendanceApp:
     def _update_status(self, text: str):
         self.root.after(0, lambda: self.status_var.set(text))
 
-    def _populate(self, daily_df, summary_df, badge_df=None):
+    def _populate(self, daily_df, summary_df, badge_df=None, comparison_df=None,):
         """Fill all Treeview widgets."""
         # summary
         self.summary_tree.delete(*self.summary_tree.get_children())
@@ -344,6 +356,19 @@ class AttendanceApp:
                         for c in cols]
                 self.badge_tree.insert("", "end", values=vals)
 
+        # name comparison
+        self.comparison_tree.delete(*self.comparison_tree.get_children())
+        if comparison_df is not None and not comparison_df.empty:
+            cols = list(comparison_df.columns)
+            self.comparison_tree.configure(columns=cols)
+            for c in cols:
+                self.comparison_tree.heading(c, text=c, anchor="w")
+                width = 220 if c == "Details" else 150
+                self.comparison_tree.column(c, width=width, minwidth=80, anchor="w")
+            for _, row in comparison_df.iterrows():
+                vals = [str(row[c]) if not pd.isna(row[c]) else "" for c in cols]
+                self.comparison_tree.insert("", "end", values=vals)
+
     # ── export ───────────────────────────────────────────────────────────
 
     def _on_export(self):
@@ -362,7 +387,7 @@ class AttendanceApp:
         try:
             self.status_var.set("Exporting…")
             self.root.update_idletasks()
-            to_excel(self.daily_df, self.summary_df, path, self.badge_df)
+            to_excel(self.daily_df, self.summary_df, path, self.badge_df, self.comparison_df)
             self.status_var.set(f"Exported to {os.path.basename(path)}")
             messagebox.showinfo("Success", f"Report saved to:\n{path}")
         except Exception as exc:

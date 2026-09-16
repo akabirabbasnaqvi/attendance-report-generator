@@ -566,7 +566,8 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
                  year: int,
                  month: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Return (daily_df, summary_df, badge_df).
+    ##Return (daily_df, summary_df, badge_df).
+    Return (daily_df, summary_df, badge_df, comparison_df).
 
     badge_df contains punch records for employees whose device only
     recorded a numeric badge ID instead of a name.  They get their own
@@ -585,6 +586,51 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
     sched_names = list(sched_data.keys())
     punch_names = list(named_punch_data.keys())
     name_map = _build_name_map(sched_names, punch_names)
+
+
+    # Build comparison of names between device data and schedule data.
+    # name_map maps schedule names to matching device names.
+    matched_punch_names = set(name_map.values())
+    matched_schedule_names = set(name_map.keys())
+
+    comparison_rows = []
+
+    # Names or badge IDs found in device data but not matched to schedule.
+    for device_name in sorted(punch_data):
+        if device_name not in matched_punch_names:
+            comparison_rows.append({
+                "Category": "Device only",
+                "Name or ID": device_name.replace("_", " ").title(),
+                "Normalized Key": device_name,
+                "Details": "Found in device attendance but not matched in schedule",
+            })
+
+    # Names found in schedule data but not matched to device data.
+    for schedule_name in sorted(sched_data):
+        if schedule_name not in matched_schedule_names:
+            comparison_rows.append({
+                "Category": "Schedule only",
+                "Name or ID": schedule_name.replace("_", " ").title(),
+                "Normalized Key": schedule_name,
+                "Details": "Found in schedule but not matched in device attendance",
+            })
+
+    comparison_df = pd.DataFrame(
+        comparison_rows,
+        columns=[
+            "Category",
+            "Name or ID",
+            "Normalized Key",
+            "Details",
+        ],
+    )
+
+    if not comparison_df.empty:
+        comparison_df = comparison_df.sort_values(
+            ["Category", "Name or ID"]
+        ).reset_index(drop=True)
+
+
 
     # All days in the month
     first_day = _dt.date(year, month, 1)
@@ -750,16 +796,30 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
             last_punch = day_punches[-1] if len(day_punches) > 1 else None
 
             exp_dt = expected_datetime(shift_start, date_str, first_punch)
-            diff_minutes = (first_punch - exp_dt).total_seconds() / 60.0
+            # diff_minutes = (first_punch - exp_dt).total_seconds() / 60.0
 
-            grace = timedelta(minutes=GRACE_MINUTES)
-            if first_punch <= exp_dt + grace:
+            # grace = timedelta(minutes=GRACE_MINUTES)
+            # if first_punch <= exp_dt + grace:
+            #     status = "On Time"
+            #     on_time_days += 1
+            # else:
+            #     late_min = math.ceil(diff_minutes)
+            #     status = f"Late ({late_min} min)"
+            #     late_days += 1
+            scheduled_minute = exp_dt.replace(second=0, microsecond=0)
+            arrival_minute = first_punch.replace(second=0, microsecond=0)
+
+            diff_minutes = int((arrival_minute - scheduled_minute).total_seconds() / 60)
+
+            if diff_minutes <= GRACE_MINUTES:
                 status = "On Time"
                 on_time_days += 1
             else:
-                late_min = math.ceil(diff_minutes)
+                late_min = diff_minutes
                 status = f"Late ({late_min} min)"
                 late_days += 1
+
+
 
             present_days += 1
 
@@ -832,18 +892,52 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
     if not badge_df.empty:
         badge_df = badge_df.sort_values(["Badge ID", "Date"]).reset_index(drop=True)
 
-    return daily_df, summary_df, badge_df
+    #return daily_df, summary_df, badge_df
+    return daily_df, summary_df, badge_df, comparison_df
 
 
 # ── Excel export ─────────────────────────────────────────────────────────
 
+# def to_excel(daily_df: pd.DataFrame,
+#              summary_df: pd.DataFrame,
+#              path: str,
+#              badge_df: Optional[pd.DataFrame] = None) -> None:
+#     """Write DataFrames to a single .xlsx with separate sheets."""
+#     with pd.ExcelWriter(path, engine="openpyxl") as writer:
+#         summary_df.to_excel(writer, sheet_name="Employee Summary", index=False)
+#         daily_df.to_excel(writer, sheet_name="Daily Detail", index=False)
+#         if badge_df is not None and not badge_df.empty:
+#             badge_df.to_excel(writer, sheet_name="Badge ID Punches", index=False)
+
 def to_excel(daily_df: pd.DataFrame,
              summary_df: pd.DataFrame,
              path: str,
-             badge_df: Optional[pd.DataFrame] = None) -> None:
-    """Write DataFrames to a single .xlsx with separate sheets."""
+             badge_df: Optional[pd.DataFrame] = None,
+             comparison_df: Optional[pd.DataFrame] = None) -> None:
+    """Write all report DataFrames to separate Excel worksheets."""
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        summary_df.to_excel(writer, sheet_name="Employee Summary", index=False)
-        daily_df.to_excel(writer, sheet_name="Daily Detail", index=False)
+        summary_df.to_excel(
+            writer,
+            sheet_name="Employee Summary",
+            index=False,
+        )
+
+        daily_df.to_excel(
+            writer,
+            sheet_name="Daily Detail",
+            index=False,
+        )
+
         if badge_df is not None and not badge_df.empty:
-            badge_df.to_excel(writer, sheet_name="Badge ID Punches", index=False)
+            badge_df.to_excel(
+                writer,
+                sheet_name="Badge ID Punches",
+                index=False,
+            )
+
+        if comparison_df is not None:
+            comparison_df.to_excel(
+                writer,
+                sheet_name="Name Comparison",
+                index=False,
+            )
