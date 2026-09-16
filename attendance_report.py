@@ -10,8 +10,10 @@ import datetime as _dt
 from datetime import datetime, timedelta, time as _time
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
+from openpyxl.styles import Font, PatternFill, Alignment
 
 import pandas as pd
+from openpyxl.styles import Alignment, Font, PatternFill
 
 # ── constants ────────────────────────────────────────────────────────────
 GRACE_MINUTES = 15
@@ -941,3 +943,31 @@ def to_excel(daily_df: pd.DataFrame,
                 sheet_name="Name Comparison",
                 index=False,
             )
+
+        header_fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+        header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+        header_alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=True,
+        )
+        tab_colors = {
+            "Employee Summary": "70AD47",
+            "Daily Detail": "5B9BD5",
+            "Badge ID Punches": "ED7D31",
+            "Name Comparison": "A5A5A5",
+        }
+
+        for worksheet in writer.book.worksheets:
+            worksheet.sheet_properties.tabColor = tab_colors.get(
+                worksheet.title,
+                "5B9BD5",
+            )
+            for cell in worksheet[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = header_alignment
+            worksheet.row_dimensions[1].height = 28
+            worksheet.freeze_panes = "A2"
+            if worksheet.max_column > 0 and worksheet.max_row > 1:
+                worksheet.auto_filter.ref = worksheet.dimensions
