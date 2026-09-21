@@ -73,6 +73,58 @@ NON_WORKING_CODES = set(_LEAVE_LABELS.keys())
 _LEAVE_COUNT_CODES = {"SL", "CL", "AL", "EL", "ML", "UNPAID", "ABSENT",
                        "COMP", "LEAVE", "HALF"}
 
+# ── employee-ID matching ────────────────────────────────────────────────
+# The device export has a "No." column (each employee's device enrollment
+# number) and the schedule workbook can have an "Employees ID" column with
+# the same number. When both are present, matching by this ID is exact and
+# always wins over fuzzy name matching, which is what previously produced
+# errors whenever the schedule used a short/nickname and the device used
+# the full legal name (or vice versa).
+#
+# load_punches()/load_schedule() populate the module-level maps below as a
+# side effect of parsing each workbook; build_report() reads them to build
+# ID-based overrides before falling back to fuzzy name matching. This keeps
+# the public function signatures unchanged, so nothing else needs to change
+# to call them.
+_LAST_PUNCH_ID_TO_KEY: Dict[str, str] = {}   # normalised device ID -> punch dict key
+_LAST_SCHEDULE_ID_MAP: Dict[str, str] = {}   # normalised schedule name -> normalised ID
+
+_DEVICE_ID_COL_ALIASES = {
+    "no", "employee no", "emp no", "badge no", "badge id",
+    "employee id", "emp id", "id no", "id number", "staff no", "staff id",
+}
+
+_SCHEDULE_ID_HEADER_ALIASES = {
+    "employees id", "employee id", "emp id", "emp id no",
+    "staff id", "employee no", "emp no", "badge id", "badge no",
+    "id no", "id number", "employee id no", "id",
+}
+
+
+def _normalize_id(val) -> Optional[str]:
+    """Normalize a raw employee-ID cell value (int/float/str) to a clean,
+    comparable string key. Returns None if the cell holds no usable ID."""
+    if val is None:
+        return None
+    if isinstance(val, float):
+        if val != val:  # NaN
+            return None
+        val = int(val) if val == int(val) else val
+    if isinstance(val, int):
+        return str(val)
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return None
+    # collapse a float-like string such as "45.0" -> "45"
+    m = re.match(r"^(\d+)\.0+$", s)
+    if m:
+        s = m.group(1)
+    # strip leading zeros from pure numeric IDs ("003" -> "3") for comparison
+    if s.isdigit():
+        s = str(int(s))
+    return s.lower()
+
+
 # ── junk-row filtering ──────────────────────────────────────────────────
 _JUNK_ROW_NAMES = {
     "finance", "inventory", "surveillance department", "surveillance",
@@ -178,16 +230,25 @@ def _close_substring(needle: str, haystack: str, max_dist: int = 1) -> bool:
 
 
 def _build_name_map(sched_names: List[str],
-                    punch_names: List[str]) -> Dict[str, str]:
+                    punch_names: List[str],
+                    id_overrides: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """
     Map each *sched_name* → best matching *punch_name*.
 
     Strategy (in priority order):
       1. Exact normalised match
-      2. Schedule name is a substring of an attendance name
-      3. All word-tokens of the shorter name appear in the longer
-      4. Reverse substring (attendance key inside schedule key)
-      5. Fuzzy substring with edit-distance ≤ 1
+      2. Exact employee-ID match (see _LAST_SCHEDULE_ID_MAP /
+         _LAST_PUNCH_ID_TO_KEY), passed in via *id_overrides* — this runs
+         AFTER the exact name match on purpose: a literal name match is
+         unambiguous, while an ID column can have a data-entry typo (e.g.
+         two different employee IDs transposed), so a disagreeing ID match
+         should never override an exact name match. ID matching still
+         resolves the common case an exact match can't: a schedule
+         nickname/short-name with no literal match in the device export.
+      3. Schedule name is a substring of an attendance name
+      4. All word-tokens of the shorter name appear in the longer
+      5. Reverse substring (attendance key inside schedule key)
+      6. Fuzzy substring with edit-distance ≤ 1
     Returns a dict {normalised_sched_name: normalised_punch_name}.
     """
     norm_sched = {normalize_name(n): n for n in sched_names}
@@ -204,7 +265,16 @@ def _build_name_map(sched_names: List[str],
             unmatched_sched.discard(ns)
             used_punch.add(ns)
 
-    # pass 2 – schedule key is substring of punch key
+    # pass 2 – exact employee-ID match (see docstring: runs after exact
+    # name matching so a typo'd ID can never override an unambiguous name)
+    if id_overrides:
+        for ns, punch_key in id_overrides.items():
+            if ns in unmatched_sched and punch_key in norm_punch and punch_key not in used_punch:
+                mapping[ns] = punch_key
+                unmatched_sched.discard(ns)
+                used_punch.add(punch_key)
+
+    # pass 3 – schedule key is substring of punch key
     for ns in list(unmatched_sched):
         if len(ns) < 3:
             continue
@@ -217,7 +287,7 @@ def _build_name_map(sched_names: List[str],
                 used_punch.add(np)
                 break
 
-    # pass 3 – word-token containment (all tokens of shorter in longer)
+    # pass 4 – word-token containment (all tokens of shorter in longer)
     for ns in list(unmatched_sched):
         stok = _name_tokens(ns)
         if len(stok) < 1:
@@ -243,7 +313,7 @@ def _build_name_map(sched_names: List[str],
             unmatched_sched.discard(ns)
             used_punch.add(best)
 
-    # pass 4 – reverse substring
+    # pass 5 – reverse substring
     for ns in list(unmatched_sched):
         for np in sorted(norm_punch.keys()):
             if np in used_punch:
@@ -254,7 +324,7 @@ def _build_name_map(sched_names: List[str],
                 used_punch.add(np)
                 break
 
-    # pass 5 – fuzzy substring (edit dist ≤ 1)
+    # pass 6 – fuzzy substring (edit dist ≤ 1)
     for ns in list(unmatched_sched):
         stok = ns.split()
         for np in sorted(norm_punch.keys()):
@@ -345,7 +415,15 @@ def _classify_schedule(raw: str) -> Tuple[str, Optional[str]]:
 def load_punches(xf: pd.ExcelFile) -> Dict[str, Dict[str, List[datetime]]]:
     """
     Return {normalised_name: {date_str: [punch_datetimes]}}.
+
+    As a side effect, also populates the module-level _LAST_PUNCH_ID_TO_KEY
+    map (normalised device employee-ID -> normalised name key) whenever the
+    device workbook has an employee-ID column (e.g. "No."), so build_report()
+    can match schedule rows to device punches by ID instead of by name.
     """
+    global _LAST_PUNCH_ID_TO_KEY
+    _LAST_PUNCH_ID_TO_KEY = {}
+
     df = xf.parse(xf.sheet_names[0])
     df.columns = [str(c).strip() for c in df.columns]
 
@@ -371,9 +449,19 @@ def load_punches(xf: pd.ExcelFile) -> Dict[str, Dict[str, List[datetime]]]:
     if name_col is None:
         raise ValueError("Cannot find a 'Name' column in device data.")
 
+    # find the device employee-ID column (e.g. "No.")
+    id_col = None
+    for c in df.columns:
+        key = c.strip().lower().rstrip(".")
+        if key in _DEVICE_ID_COL_ALIASES:
+            id_col = c
+            break
+
     punches: Dict[str, Dict[str, List[datetime]]] = defaultdict(
         lambda: defaultdict(list)
     )
+    name_to_id: Dict[str, str] = {}
+
     for _, row in df.iterrows():
         raw_name = row.get(name_col)
         raw_dt = row.get(dt_col)
@@ -389,10 +477,19 @@ def load_punches(xf: pd.ExcelFile) -> Dict[str, Dict[str, List[datetime]]]:
         date_str = dt.strftime("%Y-%m-%d")
         punches[name][date_str].append(dt.to_pydatetime())
 
+        if id_col is not None and name not in name_to_id:
+            id_val = _normalize_id(row.get(id_col))
+            if id_val:
+                name_to_id[name] = id_val
+
     # sort each day's punches
     for name in punches:
         for ds in punches[name]:
             punches[name][ds].sort()
+
+    # build the ID -> punch-key alias map used by build_report()
+    for name, id_val in name_to_id.items():
+        _LAST_PUNCH_ID_TO_KEY.setdefault(id_val, name)
 
     return dict(punches)
 
@@ -404,7 +501,16 @@ def load_schedule(xf: pd.ExcelFile,
                   month: int) -> Dict[str, Dict[str, str]]:
     """
     Return {normalised_name: {date_str: schedule_value_str}}.
+
+    As a side effect, also populates the module-level _LAST_SCHEDULE_ID_MAP
+    map (normalised schedule name -> normalised employee ID) whenever the
+    schedule sheet has an employee-ID column (e.g. "Employees ID"), so
+    build_report() can match schedule rows to device punches by ID instead
+    of by name.
     """
+    global _LAST_SCHEDULE_ID_MAP
+    _LAST_SCHEDULE_ID_MAP = {}
+
     target = datetime(year, month, 1)
     best_sheet = None
     best_diff = None
@@ -432,7 +538,6 @@ def load_schedule(xf: pd.ExcelFile,
     date_row = df.iloc[0]
 
     # detect first_date_col: find where actual dates start
-    # Column 0 is the name column; sometimes col 0 also has a date (duplicate)
     first_date_col = 1
     for ci in range(len(date_row)):
         val = date_row.iloc[ci]
@@ -442,15 +547,22 @@ def load_schedule(xf: pd.ExcelFile,
             break
         except Exception:
             continue
-    # If col 0 has the same date as col 1, skip it (it's the name col)
-    if first_date_col == 0 and len(date_row) > 1:
+
+    # Some schedule templates have a stray duplicate date in the label
+    # column immediately before the real first date column (a merged-cell
+    # rendering artifact). This label column holds the employee name (or,
+    # when an "Employees ID" column has been inserted before it, the name
+    # sits one column further right) — either way it is not real shift
+    # data, so if the detected first date column repeats in the very next
+    # column, skip the first one.
+    if first_date_col + 1 < len(date_row):
         try:
-            d0 = pd.to_datetime(date_row.iloc[0])
-            d1 = pd.to_datetime(date_row.iloc[1])
+            d0 = pd.to_datetime(date_row.iloc[first_date_col])
+            d1 = pd.to_datetime(date_row.iloc[first_date_col + 1])
             if d0 == d1:
-                first_date_col = 1
+                first_date_col += 1
         except Exception:
-            first_date_col = 1
+            pass
 
     # map column index → date string
     col_dates: Dict[int, str] = {}
@@ -466,10 +578,39 @@ def load_schedule(xf: pd.ExcelFile,
     if not col_dates:
         raise ValueError(f"No date columns found for {target:%B %Y}")
 
+    # detect an employee-ID column (e.g. "Employees ID"), checked against the
+    # two header rows across any column that isn't itself a date column
+    id_col = None
+    header_rows = [df.iloc[0]]
+    if len(df) > 1:
+        header_rows.append(df.iloc[1])
+    for hdr_row in header_rows:
+        for ci in range(len(hdr_row)):
+            if ci in col_dates:
+                continue
+            val = hdr_row.iloc[ci]
+            if val is None:
+                continue
+            if isinstance(val, float) and val != val:  # NaN
+                continue
+            text = str(val).strip().lower().rstrip(".")
+            text = re.sub(r"\s+", " ", text)
+            if text in _SCHEDULE_ID_HEADER_ALIASES:
+                id_col = ci
+                break
+        if id_col is not None:
+            break
+
+    # The employee name is normally in column 0. If an "Employees ID"
+    # column was inserted right at column 0 (pushing the name one column
+    # over, as some updated templates do), read the name from column 1
+    # instead.
+    name_col = 1 if id_col == 0 else 0
+
     schedule: Dict[str, Dict[str, str]] = defaultdict(dict)
 
     for ri in range(2, len(df)):
-        raw_name = df.iloc[ri, 0]
+        raw_name = df.iloc[ri, name_col]
         if pd.isna(raw_name):
             continue
         name_str = str(raw_name).strip()
@@ -481,6 +622,11 @@ def load_schedule(xf: pd.ExcelFile,
         norm = normalize_name(name_str)
         if not norm:
             continue
+
+        if id_col is not None:
+            id_val = _normalize_id(df.iloc[ri, id_col])
+            if id_val:
+                _LAST_SCHEDULE_ID_MAP[norm] = id_val
 
         for ci, date_str in col_dates.items():
             cell = df.iloc[ri, ci]
@@ -584,15 +730,44 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
         else:
             named_punch_data[pname] = pdays
 
-    # Build the name mapping (only for named employees)
+    # ── exact employee-ID matching (authoritative, always wins) ──
+    # Uses the ID maps that load_schedule()/load_punches() populated while
+    # parsing each workbook ("Employees ID" in the schedule, "No." in the
+    # device export). This resolves the cases fuzzy name matching gets
+    # wrong — e.g. two different real people who happen to share a display
+    # name, or a schedule nickname that doesn't fuzzy-match the device's
+    # full legal name at all.
+    id_overrides: Dict[str, str] = {}
+    claimed_badge_ids: set = set()
+    for sched_key, sched_id in _LAST_SCHEDULE_ID_MAP.items():
+        if sched_key not in sched_data:
+            continue
+        punch_key = _LAST_PUNCH_ID_TO_KEY.get(sched_id)
+        if not punch_key:
+            continue
+        if punch_key in named_punch_data:
+            id_overrides[sched_key] = punch_key
+        elif punch_key in badge_punch_data and sched_key not in named_punch_data:
+            # device only ever recorded a badge number for this person; the
+            # schedule's ID tells us who they really are, so claim their
+            # punches out of the anonymous Badge ID sheet.
+            named_punch_data[sched_key] = badge_punch_data[punch_key]
+            id_overrides[sched_key] = sched_key
+            claimed_badge_ids.add(punch_key)
+
+    for bid in claimed_badge_ids:
+        badge_punch_data.pop(bid, None)
+
+    # Build the name mapping (only for named employees); ID matches above
+    # win first, fuzzy name matching fills in the rest.
     sched_names = list(sched_data.keys())
     punch_names = list(named_punch_data.keys())
-    name_map = _build_name_map(sched_names, punch_names)
+    name_map = _build_name_map(sched_names, punch_names, id_overrides=id_overrides)
 
 
     # Build comparison of names between device data and schedule data.
     # name_map maps schedule names to matching device names.
-    matched_punch_names = set(name_map.values())
+    matched_punch_names = set(name_map.values()) | claimed_badge_ids
     matched_schedule_names = set(name_map.keys())
 
     comparison_rows = []
