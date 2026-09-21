@@ -181,8 +181,18 @@ _DATE_STR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 def read_workbook(path: str) -> pd.ExcelFile:
     """Open .xls or .xlsx transparently."""
     if str(path).lower().endswith(".xls"):
-        return pd.ExcelFile(path, engine="xlrd")
-    return pd.ExcelFile(path, engine="openpyxl")
+        xf = pd.ExcelFile(path, engine="xlrd")
+    else:
+        xf = pd.ExcelFile(path, engine="openpyxl")
+    # Stash the source path on the object so downstream readers (e.g.
+    # load_schedule's merged-cell handling) can re-open the workbook in a
+    # non-read-only mode without changing this function's signature or
+    # touching any caller (pd.ExcelFile allows arbitrary extra attributes).
+    try:
+        xf._source_path = str(path)
+    except Exception:
+        pass
+    return xf
 
 
 def normalize_name(raw: str) -> str:
@@ -496,6 +506,72 @@ def load_punches(xf: pd.ExcelFile) -> Dict[str, Dict[str, List[datetime]]]:
 
 # ── schedule loading ─────────────────────────────────────────────────────
 
+def _fill_merged_cells(df: "pd.DataFrame", xf: pd.ExcelFile, sheet_name: str) -> None:
+    """
+    Forward-fill merged-cell values across their full span, in place, on the
+    freshly-parsed (header=None) DataFrame `df`.
+
+    Excel only stores a merged range's value in its top-left cell; every
+    other cell in the range reads back as blank/None through pandas and
+    openpyxl alike. A multi-day leave block (e.g. one "Annual Leaves" cell
+    merged across 8 date columns) therefore only ever shows up on the first
+    day unless we copy that top-left value into the rest of the range
+    ourselves. This must run before any date/name/id parsing below.
+
+    Reading `xf.book` directly does not work here because pandas opens the
+    openpyxl workbook in read-only mode for `ExcelFile.parse()`, and
+    read-only worksheets don't expose `.merged_cells`. So we re-open the
+    same workbook file from disk (not read-only) just to read the merge
+    geometry, using the path `read_workbook()` stashed on `xf`.
+    """
+    source_path = getattr(xf, "_source_path", None)
+    if not source_path:
+        return
+
+    try:
+        if str(source_path).lower().endswith(".xls"):
+            # Legacy .xls via xlrd: merged_cells is a list of
+            # (row_lo, row_hi, col_lo, col_hi) 0-indexed, half-open ranges —
+            # already aligned with the 0-indexed, header=None DataFrame.
+            book = xf.book  # xlrd.Book (not read-only-restricted)
+            sheet = book.sheet_by_name(sheet_name)
+            ranges = [
+                (r0, r1 - 1, c0, c1 - 1)
+                for (r0, r1, c0, c1) in getattr(sheet, "merged_cells", [])
+            ]
+        else:
+            import openpyxl
+            wb2 = openpyxl.load_workbook(source_path, data_only=True, read_only=False)
+            if sheet_name not in wb2.sheetnames:
+                return
+            ws2 = wb2[sheet_name]
+            # openpyxl ranges are 1-indexed and inclusive; convert to the
+            # 0-indexed positions used by the header=None DataFrame.
+            ranges = [
+                (mr.min_row - 1, mr.max_row - 1, mr.min_col - 1, mr.max_col - 1)
+                for mr in ws2.merged_cells.ranges
+            ]
+
+        n_rows, n_cols = df.shape
+        for r0, r1, c0, c1 in ranges:
+            if r0 < 0 or c0 < 0 or r0 >= n_rows or c0 >= n_cols:
+                continue
+            top_val = df.iat[r0, c0]
+            if top_val is None or (isinstance(top_val, float) and top_val != top_val):
+                continue
+            r_end = min(r1, n_rows - 1)
+            c_end = min(c1, n_cols - 1)
+            for ri in range(r0, r_end + 1):
+                for ci in range(c0, c_end + 1):
+                    if ri == r0 and ci == c0:
+                        continue
+                    df.iat[ri, ci] = top_val
+    except Exception:
+        # Merge-fill is a best-effort enhancement; never let it break
+        # report generation if a workbook can't be re-opened this way.
+        return
+
+
 def load_schedule(xf: pd.ExcelFile,
                   year: int,
                   month: int) -> Dict[str, Dict[str, str]]:
@@ -533,6 +609,7 @@ def load_schedule(xf: pd.ExcelFile,
         raise ValueError(f"No sheet found for {target:%B %Y}")
 
     df = xf.parse(best_sheet, header=None)
+    _fill_merged_cells(df, xf, best_sheet)
 
     # row 0 = dates, row 1 = day-of-week / department header
     date_row = df.iloc[0]
