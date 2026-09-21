@@ -709,6 +709,40 @@ def _is_badge_id(name: str) -> bool:
     return name.replace(" ", "").isdigit()
 
 
+def _format_date_ranges(date_strs: List[str]) -> str:
+    """
+    Collapse a list of 'YYYY-MM-DD' strings into human-readable ranges,
+    e.g. ['2026-09-15', ..., '2026-09-22'] -> 'Sep 15-22'.
+    Non-consecutive dates become separate comma-joined parts, e.g.
+    'Sep 5, Sep 15-22'.
+    """
+    if not date_strs:
+        return ""
+    dates = sorted({datetime.strptime(d, "%Y-%m-%d").date() for d in date_strs})
+
+    runs: List[Tuple[_dt.date, _dt.date]] = []
+    run_start = dates[0]
+    run_end = dates[0]
+    for d in dates[1:]:
+        if (d - run_end).days == 1:
+            run_end = d
+        else:
+            runs.append((run_start, run_end))
+            run_start = d
+            run_end = d
+    runs.append((run_start, run_end))
+
+    parts = []
+    for start, end in runs:
+        if start == end:
+            parts.append(start.strftime("%b %d"))
+        elif start.month == end.month and start.year == end.year:
+            parts.append(f"{start.strftime('%b %d')}-{end.strftime('%d')}")
+        else:
+            parts.append(f"{start.strftime('%b %d')} - {end.strftime('%b %d')}")
+    return ", ".join(parts)
+
+
 def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
                  sched_data: Dict[str, Dict[str, str]],
                  year: int,
@@ -852,7 +886,7 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
         absent_days = 0
         wfh_days = 0
         leave_days = 0
-        leave_detail: Dict[str, int] = defaultdict(int)  # code → count
+        leave_detail: Dict[str, List[str]] = defaultdict(list)  # code → dates on leave
 
         for date_str in all_dates:
             sched_val = emp_schedule.get(date_str)
@@ -911,7 +945,7 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
                     pass
                 else:
                     leave_days += 1
-                    leave_detail[code] += 1
+                    leave_detail[code].append(date_str)
 
                 clock_in = ""
                 clock_out = ""
@@ -1013,8 +1047,9 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
             })
 
         # ── summary row ──
-        leave_breakdown = ", ".join(
-            f"{_LEAVE_LABELS.get(c, c)}: {n}" for c, n in sorted(leave_detail.items())
+        leave_breakdown = "; ".join(
+            f"{_LEAVE_LABELS.get(c, c)}: {_format_date_ranges(dates)}"
+            for c, dates in sorted(leave_detail.items())
         )
         summary_rows.append({
             "Employee": display_name,
