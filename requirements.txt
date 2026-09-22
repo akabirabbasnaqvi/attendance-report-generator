@@ -2,4 +2,5 @@ pandas
 openpyxl
 xlrd
 customtkinter
+tkcalendar
 pyinstaller

@@ -722,6 +722,78 @@ def load_schedule(xf: pd.ExcelFile,
     return dict(schedule)
 
 
+def _to_date(val) -> _dt.date:
+    """Coerce a date, datetime, or 'YYYY-MM-DD' string into a date object."""
+    if isinstance(val, _dt.datetime):
+        return val.date()
+    if isinstance(val, _dt.date):
+        return val
+    return datetime.strptime(str(val), "%Y-%m-%d").date()
+
+
+def load_schedule_range(xf: pd.ExcelFile,
+                        start_date,
+                        end_date) -> Dict[str, Dict[str, str]]:
+    """
+    Like load_schedule(), but for an arbitrary [start_date, end_date] span
+    instead of a single calendar month.
+
+    Schedule workbooks store one sheet per month, so this calls
+    load_schedule() once for every distinct (year, month) the range
+    touches and merges the results, trimming each employee's day-map down
+    to just the requested dates. A month with no matching sheet in the
+    workbook is skipped rather than failing the whole range, unless the
+    range matches no sheet at all.
+
+    Also merges _LAST_SCHEDULE_ID_MAP across every sheet touched, so the
+    ID-based matching in build_report() still sees the full picture even
+    when the report spans more than one schedule sheet.
+    """
+    global _LAST_SCHEDULE_ID_MAP
+
+    start_d = _to_date(start_date)
+    end_d = _to_date(end_date)
+    if end_d < start_d:
+        start_d, end_d = end_d, start_d
+    start_str = start_d.strftime("%Y-%m-%d")
+    end_str = end_d.strftime("%Y-%m-%d")
+
+    months = []
+    cursor = _dt.date(start_d.year, start_d.month, 1)
+    while cursor <= end_d:
+        months.append((cursor.year, cursor.month))
+        if cursor.month == 12:
+            cursor = _dt.date(cursor.year + 1, 1, 1)
+        else:
+            cursor = _dt.date(cursor.year, cursor.month + 1, 1)
+
+    merged: Dict[str, Dict[str, str]] = defaultdict(dict)
+    merged_id_map: Dict[str, str] = {}
+    any_sheet_found = False
+
+    for (y, m) in months:
+        try:
+            month_sched = load_schedule(xf, y, m)
+        except ValueError:
+            # No sheet in this workbook for that month — skip it rather
+            # than failing the whole date range.
+            continue
+        any_sheet_found = True
+        merged_id_map.update(_LAST_SCHEDULE_ID_MAP)
+        for name, days in month_sched.items():
+            for date_str, val in days.items():
+                if start_str <= date_str <= end_str:
+                    merged[name][date_str] = val
+
+    if not any_sheet_found:
+        raise ValueError(
+            f"No schedule sheet found covering {start_d:%d %b %Y} - {end_d:%d %b %Y}"
+        )
+
+    _LAST_SCHEDULE_ID_MAP = merged_id_map
+    return dict(merged)
+
+
 # ── time helpers ─────────────────────────────────────────────────────────
 
 def parse_start_time(sched_val: str) -> Optional[_time]:
@@ -820,12 +892,94 @@ def _format_date_ranges(date_strs: List[str]) -> str:
     return ", ".join(parts)
 
 
+_NIGHT_SHIFT_HOUR = 18   # a scheduled start at/after 6 PM counts as a night shift
+_NIGHT_SHIFT_CUTOFF = _time(12, 0)  # early punches before noon can belong to the prior night
+
+
+def _reassign_night_shift_punches(emp_schedule: Dict[str, str],
+                                  emp_punches: Dict[str, List[datetime]]
+                                  ) -> Dict[str, List[datetime]]:
+    """
+    Re-attribute punches that were logged just after midnight to the night
+    shift they actually belong to, instead of the punch's own raw
+    calendar date.
+
+    The device logs every punch under its own calendar date. For a shift
+    that starts late in the evening (e.g. 11:58 PM), the employee's
+    clock-in often lands a few minutes into the *next* calendar date
+    (e.g. 12:01 AM) — well within the grace period of the previous
+    night's shift. Left as-is, that makes the report show:
+      - the correct shift day as "Absent" (no punch was ever recorded
+        under that date), and
+      - the following day as if the employee clocked in around
+        midnight, hours before that day's own (also late-night) shift.
+
+    This walks the employee's schedule in date order; for any day whose
+    shift starts at or after 6 PM, it pulls in punches from the *next*
+    calendar day that occur before noon and re-attributes them to this
+    shift day, removing them from the next day's own punch list so they
+    are never counted twice. Day shifts (start before 6 PM) are left
+    untouched, since their punches already land on the correct date.
+    """
+    if not emp_schedule or not emp_punches:
+        return emp_punches
+
+    output: Dict[str, List[datetime]] = {
+        ds: list(plist) for ds, plist in emp_punches.items()
+    }
+
+    for date_str in sorted(emp_schedule.keys()):
+        sched_val = emp_schedule[date_str]
+        if not sched_val:
+            continue
+        kind, _detail = _classify_schedule(sched_val)
+        if kind not in ("time", "range"):
+            continue  # OFF / leave / unrecognised — no shift to roll punches into
+        shift_start = parse_start_time(sched_val)
+        if shift_start is None or shift_start.hour < _NIGHT_SHIFT_HOUR:
+            continue  # a day shift; punches already land on the right date
+
+        try:
+            d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        next_date_str = (d + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # Don't steal punches from a next day that has its own legitimate
+        # early/day shift (start before 6 PM) — only roll punches forward
+        # when the next day is unscheduled, off/leave, or itself another
+        # night shift.
+        next_sched_val = emp_schedule.get(next_date_str)
+        if next_sched_val:
+            next_kind, _nd = _classify_schedule(next_sched_val)
+            if next_kind in ("time", "range"):
+                next_shift_start = parse_start_time(next_sched_val)
+                if next_shift_start is not None and next_shift_start.hour < _NIGHT_SHIFT_HOUR:
+                    continue
+
+        next_day_punches = output.get(next_date_str)
+        if not next_day_punches:
+            continue
+
+        claimed = [p for p in next_day_punches if p.time() < _NIGHT_SHIFT_CUTOFF]
+        if not claimed:
+            continue
+
+        output[date_str] = sorted(output.get(date_str, []) + claimed)
+        output[next_date_str] = [p for p in next_day_punches if p not in claimed]
+
+    return output
+
+
 def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
                  sched_data: Dict[str, Dict[str, str]],
-                 year: int,
-                 month: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+                 start_date,
+                 end_date) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    ##Return (daily_df, summary_df, badge_df).
+    start_date / end_date may be datetime.date, datetime.datetime, or
+    'YYYY-MM-DD' strings, and mark the inclusive range the report covers
+    (previously this took a single calendar month via year/month).
+
     Return (daily_df, summary_df, badge_df, comparison_df).
 
     badge_df contains punch records for employees whose device only
@@ -920,15 +1074,14 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
 
 
 
-    # All days in the month
-    first_day = _dt.date(year, month, 1)
-    if month == 12:
-        last_day = _dt.date(year + 1, 1, 1) - _dt.timedelta(days=1)
-    else:
-        last_day = _dt.date(year, month + 1, 1) - _dt.timedelta(days=1)
-    num_days = last_day.day
+    # All days in the requested [start_date, end_date] range (inclusive)
+    start_d = _to_date(start_date)
+    end_d = _to_date(end_date)
+    if end_d < start_d:
+        start_d, end_d = end_d, start_d
+    num_days = (end_d - start_d).days + 1
     all_dates = [
-        (first_day + _dt.timedelta(days=d)).strftime("%Y-%m-%d")
+        (start_d + _dt.timedelta(days=d)).strftime("%Y-%m-%d")
         for d in range(num_days)
     ]
 
@@ -949,6 +1102,12 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
         emp_punches = named_punch_data.get(punch_key, {})
         emp_schedule = sched_data.get(emp, {})
 
+        # Night shifts (e.g. starting 11:58 PM) often log their clock-in a
+        # few minutes into the next calendar date; re-attribute those
+        # early punches back to the correct shift day before evaluating
+        # attendance below.
+        emp_punches = _reassign_night_shift_punches(emp_schedule, emp_punches)
+
         # If employee has neither schedule nor punches, skip
         if not emp_schedule and not emp_punches:
             continue
@@ -964,6 +1123,8 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
         wfh_days = 0
         leave_days = 0
         leave_detail: Dict[str, List[str]] = defaultdict(list)  # code → dates on leave
+        off_days = 0
+        off_dates: List[str] = []
 
         for date_str in all_dates:
             sched_val = emp_schedule.get(date_str)
@@ -1017,7 +1178,8 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
                 if code == "WFH":
                     wfh_days += 1
                 elif code == "OFF":
-                    pass  # don't count OFF as leave
+                    off_days += 1
+                    off_dates.append(date_str)
                 elif code == "RESIGNED":
                     pass
                 else:
@@ -1128,6 +1290,7 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
             f"{_LEAVE_LABELS.get(c, c)}: {_format_date_ranges(dates)}"
             for c, dates in sorted(leave_detail.items())
         )
+        off_breakdown = _format_date_ranges(off_dates)
         summary_rows.append({
             "Employee": display_name,
             "Present": present_days,
@@ -1135,6 +1298,8 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
             "Late": late_days,
             "Absent": absent_days,
             "WFH": wfh_days,
+            "Off": off_days,
+            "Off Dates": off_breakdown,
             "Leave": leave_days,
             "Leave Breakdown": leave_breakdown,
         })
@@ -1153,10 +1318,10 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
     for badge_id in sorted(badge_punch_data.keys(), key=lambda x: int(x) if x.isdigit() else 0):
         days = badge_punch_data[badge_id]
         for date_str in sorted(days.keys()):
-            # only include dates within the target month
+            # only include dates within the requested range
             try:
                 d = datetime.strptime(date_str, "%Y-%m-%d").date()
-                if d.month != month or d.year != year:
+                if d < start_d or d > end_d:
                     continue
             except Exception:
                 continue

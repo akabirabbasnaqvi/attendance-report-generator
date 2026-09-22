@@ -6,7 +6,7 @@ import os
 import sys
 import threading
 import calendar
-from datetime import datetime
+from datetime import datetime, date
 from tkinter import filedialog, messagebox
 import tkinter as tk
 import tkinter.ttk as ttk
@@ -18,8 +18,14 @@ try:
 except ImportError:
     HAS_CTK = False
 
+try:
+    from tkcalendar import DateEntry
+    HAS_TKCALENDAR = True
+except ImportError:
+    HAS_TKCALENDAR = False
+
 from attendance_report import (
-    read_workbook, load_punches, load_schedule,
+    read_workbook, load_punches, load_schedule, load_schedule_range,
     build_report, to_excel,
 )
 
@@ -134,26 +140,43 @@ class AttendanceApp:
 
         top.grid_columnconfigure(1, weight=1)
 
-        # middle frame – month picker + buttons
+        # middle frame – date range picker + buttons
         mid = _BaseFrame(root)
         mid.pack(fill="x", padx=16, pady=4)
 
-        _Label(mid, text="Month:").pack(side="left", padx=(4, 2))
-
-        months = [f"{calendar.month_name[m]} {y}"
-                  for y in range(2024, 2028)
-                  for m in range(1, 13)]
         now = datetime.now()
-        default_month = f"{calendar.month_name[now.month]} {now.year}"
+        month_start = date(now.year, now.month, 1)
+        today = date(now.year, now.month, now.day)
 
-        if HAS_CTK:
-            self.month_var = ctk.StringVar(value=default_month)
-            _OptionMenu(mid, variable=self.month_var,
-                        values=months, width=170).pack(side="left", padx=4)
+        _Label(mid, text="From:").pack(side="left", padx=(4, 2))
+        if HAS_TKCALENDAR:
+            self.start_date_picker = DateEntry(
+                mid, width=11, date_pattern="dd-mm-yyyy",
+                year=month_start.year, month=month_start.month,
+                day=month_start.day, background="#1f6aa5",
+                foreground="white", borderwidth=2,
+            )
+            self.start_date_picker.pack(side="left", padx=(0, 10))
         else:
-            self.month_var = tk.StringVar(value=default_month)
-            tk.OptionMenu(mid, self.month_var, *months).pack(side="left",
-                                                              padx=4)
+            self.start_date_entry = _Entry(mid, width=100)
+            self._set_entry(self.start_date_entry, month_start.strftime("%Y-%m-%d"))
+            self.start_date_entry.pack(side="left", padx=(0, 10))
+
+        _Label(mid, text="To:").pack(side="left", padx=(4, 2))
+        if HAS_TKCALENDAR:
+            self.end_date_picker = DateEntry(
+                mid, width=11, date_pattern="dd-mm-yyyy",
+                year=today.year, month=today.month, day=today.day,
+                background="#1f6aa5", foreground="white", borderwidth=2,
+            )
+            self.end_date_picker.pack(side="left", padx=(0, 10))
+        else:
+            self.end_date_entry = _Entry(mid, width=100)
+            self._set_entry(self.end_date_entry, today.strftime("%Y-%m-%d"))
+            self.end_date_entry.pack(side="left", padx=(0, 10))
+            _Label(mid, text="(install tkcalendar for a calendar picker: "
+                             "pip install tkcalendar — using YYYY-MM-DD text "
+                             "fields for now)").pack(side="left", padx=(4, 10))
 
         _Button(mid, text="Generate Report",
                 command=self._on_generate).pack(side="left", padx=12)
@@ -187,7 +210,7 @@ class AttendanceApp:
 
         self.summary_tree = self._make_tree(tab_summary, [
             "Employee", "Present", "On Time", "Late",
-            "Absent", "WFH", "Leave", "Leave Breakdown",
+            "Absent", "WFH", "Off", "Off Dates", "Leave", "Leave Breakdown",
         ])
         self.detail_tree = self._make_tree(tab_detail, [
             "Employee", "Date", "Day", "Scheduled",
@@ -222,7 +245,7 @@ class AttendanceApp:
 
         # column widths
         for col in columns:
-            width = 140 if col in ("Employee", "Leave Breakdown", "Remarks") else 95
+            width = 140 if col in ("Employee", "Leave Breakdown", "Off Dates", "Remarks") else 95
             tree.heading(col, text=col, anchor="w")
             tree.column(col, width=width, minwidth=60, anchor="w")
 
@@ -263,6 +286,20 @@ class AttendanceApp:
             self.device_path = path
             self._set_entry(self.dev_entry, path)
 
+    def _get_date_range(self):
+        """Read the From/To range from whichever date widgets are active."""
+        if HAS_TKCALENDAR:
+            start_d = self.start_date_picker.get_date()
+            end_d = self.end_date_picker.get_date()
+        else:
+            start_d = datetime.strptime(
+                self.start_date_entry.get().strip(), "%Y-%m-%d").date()
+            end_d = datetime.strptime(
+                self.end_date_entry.get().strip(), "%Y-%m-%d").date()
+        if end_d < start_d:
+            start_d, end_d = end_d, start_d
+        return start_d, end_d
+
     # ── generation ───────────────────────────────────────────────────────
 
     def _on_generate(self):
@@ -286,15 +323,13 @@ class AttendanceApp:
             self._update_status("Reading schedule…")
             sched_xf = read_workbook(self.schedule_path)
 
-            # parse month
-            month_str = self.month_var.get()
-            dt = datetime.strptime(month_str, "%B %Y")
-            year, month = dt.year, dt.month
+            start_date, end_date = self._get_date_range()
 
-            schedule = load_schedule(sched_xf, year, month)
+            schedule = load_schedule_range(sched_xf, start_date, end_date)
 
             self._update_status("Building report…")
-            daily_df, summary_df, badge_df, comparison_df = build_report(punches, schedule, year, month)
+            daily_df, summary_df, badge_df, comparison_df = build_report(
+                punches, schedule, start_date, end_date)
 
             self.daily_df = daily_df
             self.summary_df = summary_df
