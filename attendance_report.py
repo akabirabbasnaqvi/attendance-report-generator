@@ -89,6 +89,29 @@ _LEAVE_COUNT_CODES = {"SL", "CL", "AL", "EL", "ML", "UNPAID", "ABSENT",
 _LAST_PUNCH_ID_TO_KEY: Dict[str, str] = {}   # normalised device ID -> punch dict key
 _LAST_SCHEDULE_ID_MAP: Dict[str, str] = {}   # normalised schedule name -> normalised ID
 
+# ── department extraction ───────────────────────────────────────────────
+# The schedule sheet has no dedicated "Department" column. Instead, each
+# department appears as its own section-header row (no ID, just the
+# department's name in the name column), followed by that department's
+# employee rows, until the next section-header row. load_schedule() walks
+# the sheet top-to-bottom carrying "the department seen most recently" and
+# stamps it onto every employee row beneath it (blank rows in between don't
+# reset it — a department's block can have blank separator rows).
+_LAST_SCHEDULE_DEPT_MAP: Dict[str, str] = {}  # normalised schedule name -> department label
+
+_DEPARTMENT_ALIASES: Dict[str, str] = {
+    "finance":                       "Finance",
+    "inventory":                     "Inventory",
+    "reporting":                     "Reporting",
+    "automation & it department":    "Automation & IT",
+    "automation":                    "Automation & IT",
+    "it department":                 "Automation & IT",
+    "surveillance department":       "Surveillance",
+    "surveillance":                  "Surveillance",
+    "operations department":         "Operations",
+    "operations":                    "Operations",
+}
+
 _DEVICE_ID_COL_ALIASES = {
     "no", "employee no", "emp no", "badge no", "badge id",
     "employee id", "emp id", "id no", "id number", "staff no", "staff id",
@@ -582,10 +605,13 @@ def load_schedule(xf: pd.ExcelFile,
     map (normalised schedule name -> normalised employee ID) whenever the
     schedule sheet has an employee-ID column (e.g. "Employees ID"), so
     build_report() can match schedule rows to device punches by ID instead
-    of by name.
+    of by name. Also populates _LAST_SCHEDULE_DEPT_MAP (normalised schedule
+    name -> department label) from the department section-header rows
+    interleaved among the employee rows.
     """
-    global _LAST_SCHEDULE_ID_MAP
+    global _LAST_SCHEDULE_ID_MAP, _LAST_SCHEDULE_DEPT_MAP
     _LAST_SCHEDULE_ID_MAP = {}
+    _LAST_SCHEDULE_DEPT_MAP = {}
 
     target = datetime(year, month, 1)
     best_sheet = None
@@ -685,6 +711,7 @@ def load_schedule(xf: pd.ExcelFile,
     name_col = 1 if id_col == 0 else 0
 
     schedule: Dict[str, Dict[str, str]] = defaultdict(dict)
+    current_dept: str = ""
 
     for ri in range(2, len(df)):
         raw_name = df.iloc[ri, name_col]
@@ -693,6 +720,12 @@ def load_schedule(xf: pd.ExcelFile,
         name_str = str(raw_name).strip()
         if not name_str:
             continue
+
+        dept_label = _DEPARTMENT_ALIASES.get(name_str.lower())
+        if dept_label is not None:
+            current_dept = dept_label
+            continue  # section header, not an employee row
+
         if _is_junk_row(name_str):
             continue
 
@@ -704,6 +737,9 @@ def load_schedule(xf: pd.ExcelFile,
             id_val = _normalize_id(df.iloc[ri, id_col])
             if id_val:
                 _LAST_SCHEDULE_ID_MAP[norm] = id_val
+
+        if current_dept:
+            _LAST_SCHEDULE_DEPT_MAP[norm] = current_dept
 
         for ci, date_str in col_dates.items():
             cell = df.iloc[ri, ci]
@@ -745,11 +781,12 @@ def load_schedule_range(xf: pd.ExcelFile,
     workbook is skipped rather than failing the whole range, unless the
     range matches no sheet at all.
 
-    Also merges _LAST_SCHEDULE_ID_MAP across every sheet touched, so the
-    ID-based matching in build_report() still sees the full picture even
-    when the report spans more than one schedule sheet.
+    Also merges _LAST_SCHEDULE_ID_MAP and _LAST_SCHEDULE_DEPT_MAP across
+    every sheet touched, so the ID-based matching and department lookup in
+    build_report() still see the full picture even when the report spans
+    more than one schedule sheet.
     """
-    global _LAST_SCHEDULE_ID_MAP
+    global _LAST_SCHEDULE_ID_MAP, _LAST_SCHEDULE_DEPT_MAP
 
     start_d = _to_date(start_date)
     end_d = _to_date(end_date)
@@ -769,6 +806,7 @@ def load_schedule_range(xf: pd.ExcelFile,
 
     merged: Dict[str, Dict[str, str]] = defaultdict(dict)
     merged_id_map: Dict[str, str] = {}
+    merged_dept_map: Dict[str, str] = {}
     any_sheet_found = False
 
     for (y, m) in months:
@@ -780,6 +818,7 @@ def load_schedule_range(xf: pd.ExcelFile,
             continue
         any_sheet_found = True
         merged_id_map.update(_LAST_SCHEDULE_ID_MAP)
+        merged_dept_map.update(_LAST_SCHEDULE_DEPT_MAP)
         for name, days in month_sched.items():
             for date_str, val in days.items():
                 if start_str <= date_str <= end_str:
@@ -791,6 +830,7 @@ def load_schedule_range(xf: pd.ExcelFile,
         )
 
     _LAST_SCHEDULE_ID_MAP = merged_id_map
+    _LAST_SCHEDULE_DEPT_MAP = merged_dept_map
     return dict(merged)
 
 
@@ -1134,6 +1174,7 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
         # Employee ID: prefer the schedule's own "Employees ID" column,
         # fall back to the device's "No." column via the matched punch key.
         employee_id = _LAST_SCHEDULE_ID_MAP.get(emp) or punch_key_to_id.get(punch_key, "")
+        department = _LAST_SCHEDULE_DEPT_MAP.get(emp, "")
 
         # Night shifts (e.g. starting 11:58 PM) often log their clock-in a
         # few minutes into the next calendar date; re-attribute those
@@ -1340,6 +1381,7 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
         summary_rows.append({
             "Employee ID": employee_id,
             "Employee": display_name,
+            "Department": department,
             "Present": present_days,
             "On Time": on_time_days,
             "Late": late_days,
