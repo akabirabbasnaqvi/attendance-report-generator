@@ -1118,11 +1118,22 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
     daily_rows = []
     summary_rows = []
 
+    # Reverse of _LAST_PUNCH_ID_TO_KEY (device-side "No." column), so an
+    # employee's ID can be looked up by punch key when the schedule sheet
+    # itself has no "Employees ID" column for them.
+    punch_key_to_id: Dict[str, str] = {}
+    for id_val, pkey in _LAST_PUNCH_ID_TO_KEY.items():
+        punch_key_to_id.setdefault(pkey, id_val)
+
     for emp in sorted(all_employees):
         # resolve which punch key to use
         punch_key = name_map.get(emp, emp)
         emp_punches = named_punch_data.get(punch_key, {})
         emp_schedule = sched_data.get(emp, {})
+
+        # Employee ID: prefer the schedule's own "Employees ID" column,
+        # fall back to the device's "No." column via the matched punch key.
+        employee_id = _LAST_SCHEDULE_ID_MAP.get(emp) or punch_key_to_id.get(punch_key, "")
 
         # Night shifts (e.g. starting 11:58 PM) often log their clock-in a
         # few minutes into the next calendar date; re-attribute those
@@ -1327,6 +1338,7 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
         )
         off_breakdown = _format_date_ranges(off_dates)
         summary_rows.append({
+            "Employee ID": employee_id,
             "Employee": display_name,
             "Present": present_days,
             "On Time": on_time_days,
