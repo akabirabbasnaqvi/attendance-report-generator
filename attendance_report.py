@@ -894,6 +894,12 @@ def _format_date_ranges(date_strs: List[str]) -> str:
 
 _NIGHT_SHIFT_HOUR = 18   # a scheduled start at/after 6 PM counts as a night shift
 _NIGHT_SHIFT_CUTOFF = _time(12, 0)  # early punches before noon can belong to the prior night
+_EARLY_ROLLOVER_HOUR = 6  # a next-day *schedule* start before 6 AM is still
+                          # treated as the previous night's shift spilling
+                          # past midnight, not a genuine separate day shift
+                          # (e.g. a manager re-times a shift from 11:58 PM to
+                          # 12:30 AM and records it under the next day's
+                          # column — that 12:30 AM is still "last night")
 
 
 def _reassign_night_shift_punches(emp_schedule: Dict[str, str],
@@ -908,18 +914,29 @@ def _reassign_night_shift_punches(emp_schedule: Dict[str, str],
     that starts late in the evening (e.g. 11:58 PM), the employee's
     clock-in often lands a few minutes into the *next* calendar date
     (e.g. 12:01 AM) — well within the grace period of the previous
-    night's shift. Left as-is, that makes the report show:
+    night's shift. The same thing happens, only more so, when the
+    *schedule itself* lists the shift's start time as an early-morning
+    hour (e.g. "12:30 AM") under a given day's column: that value is
+    still meant as "last night's shift, written under the day it spills
+    into" (see _EARLY_ROLLOVER_HOUR above), so the employee's actual
+    clock-in — timestamped by the device using its own real-world
+    calendar date — lands on the *following* day, not the scheduled
+    day. Left as-is, that makes the report show:
       - the correct shift day as "Absent" (no punch was ever recorded
         under that date), and
       - the following day as if the employee clocked in around
-        midnight, hours before that day's own (also late-night) shift.
+        midnight, hours before that day's own (also late-night) shift,
+        or "Punched despite Off" if the following day isn't scheduled
+        to work at all.
 
     This walks the employee's schedule in date order; for any day whose
-    shift starts at or after 6 PM, it pulls in punches from the *next*
-    calendar day that occur before noon and re-attributes them to this
-    shift day, removing them from the next day's own punch list so they
-    are never counted twice. Day shifts (start before 6 PM) are left
-    untouched, since their punches already land on the correct date.
+    shift starts at or after 6 PM, *or* before 6 AM (an early-morning
+    schedule entry — still last night's shift, not a genuine same-day
+    shift), it pulls in punches from the *next* calendar day that occur
+    before noon and re-attributes them to this shift day, removing them
+    from the next day's own punch list so they are never counted twice.
+    Genuine daytime shifts (starting 6 AM-5:59 PM) are left untouched,
+    since their punches already land on the correct date.
     """
     if not emp_schedule or not emp_punches:
         return emp_punches
@@ -936,8 +953,10 @@ def _reassign_night_shift_punches(emp_schedule: Dict[str, str],
         if kind not in ("time", "range"):
             continue  # OFF / leave / unrecognised — no shift to roll punches into
         shift_start = parse_start_time(sched_val)
-        if shift_start is None or shift_start.hour < _NIGHT_SHIFT_HOUR:
-            continue  # a day shift; punches already land on the right date
+        if shift_start is None:
+            continue
+        if _EARLY_ROLLOVER_HOUR <= shift_start.hour < _NIGHT_SHIFT_HOUR:
+            continue  # a genuine daytime shift; punches already land on the right date
 
         try:
             d = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -946,15 +965,18 @@ def _reassign_night_shift_punches(emp_schedule: Dict[str, str],
         next_date_str = (d + timedelta(days=1)).strftime("%Y-%m-%d")
 
         # Don't steal punches from a next day that has its own legitimate
-        # early/day shift (start before 6 PM) — only roll punches forward
-        # when the next day is unscheduled, off/leave, or itself another
-        # night shift.
+        # daytime shift (starting 6 AM-5:59 PM) — only roll punches forward
+        # when the next day is unscheduled, off/leave, itself another night
+        # shift, or (the common re-timed-shift case) also scheduled very
+        # early in the morning, which is still last night's shift, not a
+        # separate day shift.
         next_sched_val = emp_schedule.get(next_date_str)
         if next_sched_val:
             next_kind, _nd = _classify_schedule(next_sched_val)
             if next_kind in ("time", "range"):
                 next_shift_start = parse_start_time(next_sched_val)
-                if next_shift_start is not None and next_shift_start.hour < _NIGHT_SHIFT_HOUR:
+                if (next_shift_start is not None
+                        and _EARLY_ROLLOVER_HOUR <= next_shift_start.hour < _NIGHT_SHIFT_HOUR):
                     continue
 
         next_day_punches = output.get(next_date_str)
@@ -1245,7 +1267,20 @@ def build_report(punch_data: Dict[str, Dict[str, List[datetime]]],
             first_punch = day_punches[0]
             last_punch = day_punches[-1] if len(day_punches) > 1 else None
 
-            exp_dt = expected_datetime(shift_start, date_str, first_punch)
+            # An early-morning shift (e.g. "12:30 AM") that was rolled
+            # forward from the *next* calendar day by
+            # _reassign_night_shift_punches() still carries that next
+            # day's real date on its datetime object — only the dict key
+            # (this row's date_str) changed. Comparing it against a
+            # scheduled time anchored to date_str would then be off by a
+            # full day (e.g. "736 min late" instead of "16 min late"), so
+            # anchor the expected time to the punch's own calendar date in
+            # that case instead.
+            base_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            if shift_start.hour < _EARLY_ROLLOVER_HOUR and first_punch.date() != base_date:
+                exp_dt = datetime.combine(first_punch.date(), shift_start)
+            else:
+                exp_dt = expected_datetime(shift_start, date_str, first_punch)
             # diff_minutes = (first_punch - exp_dt).total_seconds() / 60.0
 
             # grace = timedelta(minutes=GRACE_MINUTES)
